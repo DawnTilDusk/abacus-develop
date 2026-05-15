@@ -6,6 +6,8 @@
 #include "source_base/timer.h"
 #include "source_hamilt/module_xc/xc_functional.h"
 #include "source_io/module_parameter/parameter.h"
+#include <cstring>
+#include <vector>
 #ifdef __MPI
 void Charge::init_chgmpi()
 {
@@ -62,6 +64,47 @@ void Charge::extract_uniform_to_local(const double* array_tot, double* array_rho
     }
 }
 
+void Charge::gather_pool_data_nonblocking(const double* array_tmp, double* array_tot) const
+{
+    const int my_rank = GlobalV::RANK_IN_POOL;
+    const int nproc = GlobalV::NPROC_IN_POOL;
+    constexpr int gather_tag = 1024;
+
+    std::memcpy(array_tot + dis[my_rank], array_tmp, sizeof(double) * rec[my_rank]);
+
+    if (nproc <= 1)
+    {
+        return;
+    }
+
+    std::vector<MPI_Request> requests;
+    requests.reserve(2 * (nproc - 1));
+
+    for (int ip = 0; ip < nproc; ++ip)
+    {
+        if (ip == my_rank)
+        {
+            continue;
+        }
+        MPI_Request recv_req;
+        MPI_Irecv(array_tot + dis[ip], rec[ip], MPI_DOUBLE, ip, gather_tag, POOL_WORLD, &recv_req);
+        requests.push_back(recv_req);
+    }
+
+    for (int ip = 0; ip < nproc; ++ip)
+    {
+        if (ip == my_rank)
+        {
+            continue;
+        }
+        MPI_Request send_req;
+        MPI_Isend(array_tmp, rec[my_rank], MPI_DOUBLE, ip, gather_tag, POOL_WORLD, &send_req);
+        requests.push_back(send_req);
+    }
+
+    MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+}
+
 void Charge::reduce_diff_pools(double* array_rho) const
 {
     ModuleBase::TITLE("Charge", "reduce_diff_pools");
@@ -82,7 +125,12 @@ void Charge::reduce_diff_pools(double* array_rho) const
         {
             array_tmp[ir] = array_rho[ir] / GlobalV::NPROC_IN_POOL;
         }
-        MPI_Allgatherv(array_tmp, this->rhopw->nrxx, MPI_DOUBLE, array_tot, rec, dis, MPI_DOUBLE, POOL_WORLD);
+
+        //=================================================
+        // Gather the rho in each pool 
+        // replace MPI_Allgatherv with nonblocking version
+        //=================================================
+        gather_pool_data_nonblocking(array_tmp, array_tot);
         
         //======================================
         // Reorder the order of rho in each pool

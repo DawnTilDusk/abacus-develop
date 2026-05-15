@@ -151,6 +151,11 @@ class Charge
      */
     void extract_uniform_to_local(const double* array_tot, double* array_rho) const;
 
+    /**
+     * @brief Collect pooled local slabs into a full-grid buffer with nonblocking point-to-point MPI.
+     */
+    void gather_pool_data_nonblocking(const double* array_tmp, double* array_tot) const;
+
 	/**
 	 * @brief 	Reduce among different pools 
      *          If NPROC_IN_POOLs are all the same, use GlobalV::KP_WORLD
