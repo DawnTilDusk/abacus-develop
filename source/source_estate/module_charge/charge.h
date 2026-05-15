@@ -141,6 +141,16 @@ class Charge
      */
     void kin_r_mpi();
 
+    /**
+     * @brief Reorder pooled full-grid data to a z-major uniform layout.
+     */
+    void reorder_pool_to_uniform(const double* array_tot, double* array_tot_aux) const;
+
+    /**
+     * @brief Extract current rank's local slab from the uniform full-grid layout.
+     */
+    void extract_uniform_to_local(const double* array_tot, double* array_rho) const;
+
 	/**
 	 * @brief 	Reduce among different pools 
      *          If NPROC_IN_POOLs are all the same, use GlobalV::KP_WORLD
@@ -173,6 +183,9 @@ class Charge
 #ifdef __MPI
     int *rec = nullptr; //The number of elements each process should receive into the receive buffer.
     int *dis = nullptr; //The displacement (relative to recvbuf) for each process in the receive buffer.
+    double* chgmpi_tmp_ = nullptr;
+    double* chgmpi_tot_ = nullptr;
+    double* chgmpi_tot_aux_ = nullptr;
 #endif
     
 };

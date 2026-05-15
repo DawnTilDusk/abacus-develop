@@ -22,6 +22,43 @@ void Charge::init_chgmpi()
             rec[ip] = this->rhopw->numz[ip] * ncxy;
             dis[ip] = this->rhopw->startz[ip] * ncxy;
         }
+        
+        //release memory before re-allocating
+        delete[] chgmpi_tmp_;
+        delete[] chgmpi_tot_;
+        delete[] chgmpi_tot_aux_;
+        chgmpi_tmp_ = new double[this->rhopw->nxyz];
+        chgmpi_tot_ = new double[this->rhopw->nxyz];
+        chgmpi_tot_aux_ = new double[this->rhopw->nxyz];
+    }
+}
+
+void Charge::reorder_pool_to_uniform(const double* array_tot, double* array_tot_aux) const
+{
+    const int ncxy = this->rhopw->nx * this->rhopw->ny;
+    for (int ip = 0; ip < GlobalV::NPROC_IN_POOL; ++ip)
+    {
+        for (int ir = 0; ir < ncxy; ++ir)
+        {
+            for (int iz = 0; iz < this->rhopw->numz[ip]; ++iz)
+            {
+                array_tot_aux[this->rhopw->nz * ir + this->rhopw->startz[ip] + iz]
+                    = array_tot[this->rhopw->numz[ip] * ir + this->rhopw->startz[ip] * ncxy + iz];
+            }
+        }
+    }    
+}
+
+void Charge::extract_uniform_to_local(const double* array_tot, double* array_rho) const
+{
+    const int ncxy = this->rhopw->nx * this->rhopw->ny;
+    for (int ir = 0; ir < ncxy; ir++)
+    {
+        for (int iz = 0; iz < this->rhopw->numz[GlobalV::RANK_IN_POOL]; iz++)
+        {
+            array_rho[this->rhopw->numz[GlobalV::RANK_IN_POOL] * ir + iz]
+                = array_tot[this->rhopw->nz * ir + this->rhopw->startz_current + iz];
+        }
     }
 }
 
@@ -35,9 +72,9 @@ void Charge::reduce_diff_pools(double* array_rho) const
     }
     else
     {
-        double* array_tmp = new double[this->rhopw->nxyz];
-        double* array_tot = new double[this->rhopw->nxyz];
-        double* array_tot_aux = new double[this->rhopw->nxyz];
+        double* array_tmp = this->chgmpi_tmp_;
+        double* array_tot = this->chgmpi_tot_;
+        double* array_tot_aux = this->chgmpi_tot_aux_;
         //==================================
         // Collect the rho in each pool
         //==================================
@@ -46,49 +83,11 @@ void Charge::reduce_diff_pools(double* array_rho) const
             array_tmp[ir] = array_rho[ir] / GlobalV::NPROC_IN_POOL;
         }
         MPI_Allgatherv(array_tmp, this->rhopw->nrxx, MPI_DOUBLE, array_tot, rec, dis, MPI_DOUBLE, POOL_WORLD);
-
-        const int ncxy = this->rhopw->nx * this->rhopw->ny;
-        for (int ip = 0; ip < GlobalV::NPROC_IN_POOL; ++ip)
-        {
-            for (int ir = 0; ir < ncxy; ++ir)
-            {
-                for (int iz = 0; iz < this->rhopw->numz[ip]; ++iz)
-                {
-                    // -------------------------------------------------
-                    // very carefully with the order of charge density.
-                    // the data (ir,iz) is now in processor 'ip'.
-                    // different POOL has different ordering.
-                    // we want to collect them in each processor
-                    // in a unit format,
-                    // and then reduce among all POOLS to yield
-                    // the correct charge density.
-                    // we know the division of 'z' is indipendent
-                    // in each processor, so the 'unit format'
-                    // must have no relationship with 'z' divide method.
-                    // -------------------------------------------------
-                    // rot_tot_aux : suitable among all pools.
-                    // (1) the data save along z direction.
-                    // (2) and each element number of group 'z data'
-                    // is 'this->rhopw->nz'
-                    // (3) however, the data rearrange is occured
-                    // between [ this->rhopw->startz[ip], this->rhopw->startz[ip]+this->rhopw->numz[ip] )
-                    // (4) this->rhopw->startz[ip] + iz yields correct z coordiante.
-                    // -------------------------------------------------
-                    // rot_tot: suitable for local pool.
-                    // (1) the data save along z direction, only
-                    // in a small distance.
-                    // (2) however, the number of z in each processor
-                    // 'ip' is this->rhopw->numz[ip]
-                    // (3) the index of data increases with the ip,
-                    // so the data on large 'ip' processor must
-                    // have large 'start position', which we label
-                    // this->rhopw->startz[ip] * ncxy.
-                    // -------------------------------------------------
-                    array_tot_aux[this->rhopw->nz * ir + this->rhopw->startz[ip] + iz]
-                        = array_tot[this->rhopw->numz[ip] * ir + this->rhopw->startz[ip] * ncxy + iz];
-                }
-            }
-        }
+        
+        //======================================
+        // Reorder the order of rho in each pool
+        //======================================
+        reorder_pool_to_uniform(array_tot, array_tot_aux);
 
         //==================================
         // Reduce all the rho in each cpu
@@ -98,17 +97,7 @@ void Charge::reduce_diff_pools(double* array_rho) const
         //=====================================
         // Change the order of rho in each cpu
         //=====================================
-        for (int ir = 0; ir < ncxy; ir++)
-        {
-            for (int iz = 0; iz < this->rhopw->numz[GlobalV::RANK_IN_POOL]; iz++)
-            {
-                array_rho[this->rhopw->numz[GlobalV::RANK_IN_POOL] * ir + iz]
-                    = array_tot[this->rhopw->nz * ir + this->rhopw->startz_current + iz];
-            }
-        }
-        delete[] array_tot_aux;
-        delete[] array_tot;
-        delete[] array_tmp;
+        extract_uniform_to_local(array_tot, array_rho);
     }
     if(PARAM.globalv.all_ks_run && PARAM.inp.bndpar > 1)
     {

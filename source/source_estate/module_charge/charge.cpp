@@ -45,6 +45,9 @@ Charge::~Charge()
 #ifdef __MPI
     delete[] rec;
     delete[] dis;
+    delete[] chgmpi_tmp_;
+    delete[] chgmpi_tot_;
+    delete[] chgmpi_tot_aux_;
 #endif
 }
 
