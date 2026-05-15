@@ -154,7 +154,7 @@ class Charge
     /**
      * @brief Collect pooled local slabs into a full-grid buffer with nonblocking point-to-point MPI.
      */
-    void gather_pool_data_nonblocking(const double* array_tmp, double* array_tot) const;
+    void gather_pool_data_nonblocking(const double* array_tmp, double* array_tot, double* array_tot_aux) const;
 
 	/**
 	 * @brief 	Reduce among different pools 
@@ -191,6 +191,8 @@ class Charge
     double* chgmpi_tmp_ = nullptr;
     double* chgmpi_tot_ = nullptr;
     double* chgmpi_tot_aux_ = nullptr;
+
+    void reorder_pool_rank_to_uniform(const double* array_tot, double* array_tot_aux, const int ip) const;
 #endif
     
 };

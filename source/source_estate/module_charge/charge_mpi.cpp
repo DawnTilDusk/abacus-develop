@@ -37,18 +37,23 @@ void Charge::init_chgmpi()
 
 void Charge::reorder_pool_to_uniform(const double* array_tot, double* array_tot_aux) const
 {
-    const int ncxy = this->rhopw->nx * this->rhopw->ny;
     for (int ip = 0; ip < GlobalV::NPROC_IN_POOL; ++ip)
     {
-        for (int ir = 0; ir < ncxy; ++ir)
+        reorder_pool_rank_to_uniform(array_tot, array_tot_aux, ip);
+    }
+}
+
+void Charge::reorder_pool_rank_to_uniform(const double* array_tot, double* array_tot_aux, const int ip) const
+{
+    const int ncxy = this->rhopw->nx * this->rhopw->ny;
+    for (int ir = 0; ir < ncxy; ++ir)
+    {
+        for (int iz = 0; iz < this->rhopw->numz[ip]; ++iz)
         {
-            for (int iz = 0; iz < this->rhopw->numz[ip]; ++iz)
-            {
-                array_tot_aux[this->rhopw->nz * ir + this->rhopw->startz[ip] + iz]
-                    = array_tot[this->rhopw->numz[ip] * ir + this->rhopw->startz[ip] * ncxy + iz];
-            }
+            array_tot_aux[this->rhopw->nz * ir + this->rhopw->startz[ip] + iz]
+                = array_tot[this->rhopw->numz[ip] * ir + this->rhopw->startz[ip] * ncxy + iz];
         }
-    }    
+    }
 }
 
 void Charge::extract_uniform_to_local(const double* array_tot, double* array_rho) const
@@ -64,21 +69,23 @@ void Charge::extract_uniform_to_local(const double* array_tot, double* array_rho
     }
 }
 
-void Charge::gather_pool_data_nonblocking(const double* array_tmp, double* array_tot) const
+void Charge::gather_pool_data_nonblocking(const double* array_tmp, double* array_tot, double* array_tot_aux) const
 {
     const int my_rank = GlobalV::RANK_IN_POOL;
     const int nproc = GlobalV::NPROC_IN_POOL;
     constexpr int gather_tag = 1024;
 
     std::memcpy(array_tot + dis[my_rank], array_tmp, sizeof(double) * rec[my_rank]);
+    reorder_pool_rank_to_uniform(array_tot, array_tot_aux, my_rank);
 
     if (nproc <= 1)
     {
         return;
     }
 
-    std::vector<MPI_Request> requests;
-    requests.reserve(2 * (nproc - 1));
+    std::vector<MPI_Request> recv_requests(nproc, MPI_REQUEST_NULL);
+    std::vector<MPI_Request> send_requests(nproc, MPI_REQUEST_NULL);
+    std::vector<int> completed_indices(nproc, 0);
 
     for (int ip = 0; ip < nproc; ++ip)
     {
@@ -86,9 +93,7 @@ void Charge::gather_pool_data_nonblocking(const double* array_tmp, double* array
         {
             continue;
         }
-        MPI_Request recv_req;
-        MPI_Irecv(array_tot + dis[ip], rec[ip], MPI_DOUBLE, ip, gather_tag, POOL_WORLD, &recv_req);
-        requests.push_back(recv_req);
+        MPI_Irecv(array_tot + dis[ip], rec[ip], MPI_DOUBLE, ip, gather_tag, POOL_WORLD, &recv_requests[ip]);
     }
 
     for (int ip = 0; ip < nproc; ++ip)
@@ -97,12 +102,27 @@ void Charge::gather_pool_data_nonblocking(const double* array_tmp, double* array
         {
             continue;
         }
-        MPI_Request send_req;
-        MPI_Isend(array_tmp, rec[my_rank], MPI_DOUBLE, ip, gather_tag, POOL_WORLD, &send_req);
-        requests.push_back(send_req);
+        MPI_Isend(array_tmp, rec[my_rank], MPI_DOUBLE, ip, gather_tag, POOL_WORLD, &send_requests[ip]);
     }
 
-    MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+    int remaining_recv = nproc - 1;
+    while (remaining_recv > 0)
+    {
+        int outcount = 0;
+        MPI_Waitsome(nproc, recv_requests.data(), &outcount, completed_indices.data(), MPI_STATUSES_IGNORE);
+        if (outcount == MPI_UNDEFINED)
+        {
+            break;
+        }
+        for (int i = 0; i < outcount; ++i)
+        {
+            const int ip = completed_indices[i];
+            reorder_pool_rank_to_uniform(array_tot, array_tot_aux, ip);
+        }
+        remaining_recv -= outcount;
+    }
+
+    MPI_Waitall(nproc, send_requests.data(), MPI_STATUSES_IGNORE);
 }
 
 void Charge::reduce_diff_pools(double* array_rho) const
@@ -130,12 +150,7 @@ void Charge::reduce_diff_pools(double* array_rho) const
         // Gather the rho in each pool 
         // replace MPI_Allgatherv with nonblocking version
         //=================================================
-        gather_pool_data_nonblocking(array_tmp, array_tot);
-        
-        //======================================
-        // Reorder the order of rho in each pool
-        //======================================
-        reorder_pool_to_uniform(array_tot, array_tot_aux);
+        gather_pool_data_nonblocking(array_tmp, array_tot, array_tot_aux);
 
         //==================================
         // Reduce all the rho in each cpu
