@@ -1,4 +1,4 @@
-# 题目一算法文档：`reduce_diff_pools` 的流程分析与优化设计
+# 题目一算法文档：`reduce_diff_pools` 的流程分析与优化
 
 ## 1. 文档目标
 
@@ -14,11 +14,11 @@
 - `source/source_estate/module_charge/charge_mpi.cpp`
 - 关键函数：`init_chgmpi()`、`reduce_diff_pools()`、`rho_mpi()`
 
----
+***
 
 ## 2. 问题背景
 
-在 ABACUS 的 k-point 并行模型中，不同 pool 分别负责不同 k 点的计算。  
+在 ABACUS 的 k-point 并行模型中，不同 pool 分别负责不同 k 点的计算。\
 每个 pool 计算得到的电荷密度只是总电荷密度的一部分贡献，因此在输出或进入后续流程前，需要把不同 pool 的结果进行归约求和。
 
 对于 `reduce_diff_pools(double* array_rho)` 而言：
@@ -36,7 +36,7 @@
 3. 再在不同 pool 之间做求和归约
 4. 最后切回当前 rank 对应的本地布局
 
----
+***
 
 ## 3. 原始算法流程
 
@@ -121,7 +121,7 @@ array_rho
 - `array_rho`
   - 再从完整结果中切回当前 rank 需要的局部部分
 
----
+***
 
 ## 4. 原始实现的主要问题
 
@@ -144,7 +144,7 @@ array_rho
 - `array_tot`
 - `array_tot_aux`
 
-这三个数组都具有 `nxyz` 级别的大小。  
+这三个数组都具有 `nxyz` 级别的大小。\
 当 `rho_mpi()` 对多个自旋通道、多次 SCF 迭代反复调用该函数时，内存分配和释放本身就会带来额外开销。
 
 ### 4.3 数据重排和通信逻辑耦合
@@ -163,7 +163,7 @@ array_rho
 
 ### 4.4 full-grid 缓冲区在每个进程中重复持有
 
-无论是 `MPI_Allgatherv` 还是我们当前第三阶段的非阻塞收集实现，本质语义都还是“每个进程都拿到完整 `array_tot`”。  
+无论是 `MPI_Allgatherv` 还是我们当前第三阶段的非阻塞收集实现，本质语义都还是“每个进程都拿到完整 `array_tot`”。\
 因此：
 
 - 每个进程都要为 `chgmpi_tot_` 和 `chgmpi_tot_aux_` 预留 `nxyz` 大小的内存
@@ -171,7 +171,7 @@ array_rho
 
 这部分问题在当前第三阶段尚未彻底解决，属于后续可继续优化的方向。
 
----
+***
 
 ## 5. 第二阶段优化：结构重构与缓冲区成员化
 
@@ -212,11 +212,11 @@ array_rho
 - 将“通信逻辑”和“下标映射逻辑”解耦
 - 降低后续引入非阻塞通信时的改动风险
 
----
+***
 
 ## 6. 第三阶段优化：使用 `MPI_Irecv/MPI_Isend` 替代 `MPI_Allgatherv`
 
-第三阶段的核心目标是：  
+第三阶段的核心目标是：\
 把 fallback 路径中 pool 内的阻塞式 `MPI_Allgatherv` 替换为显式的非阻塞点对点通信。
 
 ### 6.1 修改前后的对比
@@ -324,11 +324,11 @@ MPI_Waitall(...)
 
 因此 full-grid 缓冲区的内存冗余问题仍然存在。
 
----
+***
 
 ## 7. 第四阶段优化：使用 `MPI_Waitsome` 实现按块接收与按块重排
 
-第四阶段的核心目标是：  
+第四阶段的核心目标是：\
 在第三阶段“非阻塞收集”的基础上，不再等所有消息到齐后再统一重排，而是做到：
 
 - 本地块准备好后立即重排
@@ -467,7 +467,7 @@ extract_uniform_to_local(array_tot, array_rho)
 
 因此内存冗余问题仍然存在，尚未进入 root-only gather/reduce/scatter 方案。
 
----
+***
 
 ## 8. 当前算法总结
 
@@ -485,7 +485,7 @@ extract_uniform_to_local(array_tot, array_rho)
 7. 如果 all_ks_run 且 bndpar > 1，再在 BP_WORLD 上进行一次额外归约
 ```
 
----
+***
 
 ## 9. 正确性说明
 
@@ -506,7 +506,7 @@ extract_uniform_to_local(array_tot, array_rho)
 
 由于收集结果 `array_tot` 的内容和原始版本一致，因此整体数值结果保持不变。
 
----
+***
 
 ## 10. 复杂度与性能分析
 
@@ -537,11 +537,11 @@ extract_uniform_to_local(array_tot, array_rho)
 - 已经实现了接收与重排的部分重叠
 - 通过成员缓冲区管理降低了代码耦合和重复分配释放开销
 
-需要说明的是：  
-第四阶段版本不一定在所有环境下都比 `MPI_Allgatherv` 更快，因为 MPI 内部可能已经对 collective 做了很强优化。  
+需要说明的是：\
+第四阶段版本不一定在所有环境下都比 `MPI_Allgatherv` 更快，因为 MPI 内部可能已经对 collective 做了很强优化。\
 因此最终是否获得更好的性能，需要通过实际测试给出结论。
 
----
+***
 
 ## 11. 测试与验证方案
 
@@ -570,22 +570,28 @@ extract_uniform_to_local(array_tot, array_rho)
 - `nspin = 1` 和 `nspin = 2`
 - `numz` 分布不均匀时的情况
 
----
+***
 
 ## 12. 后续可继续优化的方向
 
 ### 12.1 第五阶段：改造为 root-only gather/reduce/scatter
 
-当前版本的 full-grid 缓冲区在每个进程中都重复存在。  
+当前版本的 full-grid 缓冲区在每个进程中都重复存在。\
 未来可以进一步考虑：
 
 - pool 内只让 root 收集完整数据
 - root 之间做归约
 - 再由 root 把本地块发回给各 rank
 
-这样可以显著降低 total memory footprint，但代码复杂度也会明显提高。
+这样可以显著降低 total memory footprint，但也会带来新的权衡：
 
----
+- root 会成为 gather、重排、reduce、scatter 的集中热点
+- 通信与计算负载会从“分散到各 rank”变成“集中到少数 root”
+- 在 pool 内进程较多时，时间开销不一定优于当前版本
+
+因此，本作业当前阶段优先完成“非阻塞通信 + `MPI_Waitsome` 重叠”这条优化主线，暂不继续推进 root-only 方案；后续如需进一步降低内存占用，可将其作为独立优化方向，再结合实际测试结果评估时间与空间的权衡。
+
+***
 
 ### 12.2 第六阶段：尝试异步化 `INT_BGROUP` 上的归约
 
@@ -594,14 +600,14 @@ extract_uniform_to_local(array_tot, array_rho)
 - `INT_BGROUP` 上的 `MPI_Allreduce`
 - `BP_WORLD` 上的附加归约
 
-仍然是阻塞式的。  
+仍然是阻塞式的。\
 未来可进一步研究是否能够引入：
 
 - `MPI_Iallreduce`
 
 从而继续缩短跨 pool 求和阶段的等待时间。
 
----
+***
 
 ## 13. 结论
 
