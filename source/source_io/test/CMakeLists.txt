@@ -286,6 +286,39 @@ AddTest(
 endif()
 
 AddTest(
+  TARGET MODULE_IO_write_cube_test
+  LIBS parameter ${math_libs} base device planewave
+  SOURCES write_cube_test.cpp ../module_output/write_cube.cpp ../module_output/read_cube.cpp ../../source_pw/module_pwdft/parallel_grid.cpp ../../source_basis/module_pw/test/test_tool.cpp
+)
+
+add_test(NAME MODULE_IO_write_cube_test_parallel
+      COMMAND mpirun -np 4 ./MODULE_IO_write_cube_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+AddTest(
+  TARGET MODULE_IO_charge_compression_test
+  LIBS parameter ${math_libs} base device z
+  SOURCES charge_compression_test.cpp ../../source_basis/module_pw/test/test_tool.cpp
+)
+
+add_test(NAME MODULE_IO_charge_compression_test_parallel
+      COMMAND mpirun -np 4 ./MODULE_IO_charge_compression_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+AddTest(
+  TARGET MODULE_IO_read_rhog_mpi_test
+  LIBS parameter ${math_libs} base device planewave
+  SOURCES read_rhog_mpi_test.cpp ../module_chgpot/rhog_io.cpp ../module_output/binstream.cpp ../../source_basis/module_pw/test/test_tool.cpp
+)
+
+add_test(NAME MODULE_IO_read_rhog_mpi_test_parallel
+      COMMAND mpirun -np 4 ./MODULE_IO_read_rhog_mpi_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+AddTest(
   TARGET MODULE_IO_write_elf_logic_test
   SOURCES write_elf_logic_test.cpp
 )

@@ -1,0 +1,39 @@
+======================================================================
+Task 5: 电荷密度数据压缩 — 测试结果
+======================================================================
+Date: 2026-05-22
+Test: MODULE_IO_charge_compression_test
+Library: zlib (compress2 / uncompress)
+======================================================================
+
+Correctness Tests:
+  [PASS] CompressDecompressRoundtrip_Small   — 10000 random elements, error < 1e-6
+  [PASS] AllZerosCompressesWell              — 100000 zeros, compression < 10% of raw
+  [PASS] ConstantDataCompressesWell          — 100000 constants, compression < 10% of raw
+  [PASS] RandomDataRoundtrip                 — 50000 random, roundtrip error < 1e-6
+  [PASS] SmoothGaussianDataRoundtrip         — 20^3 simulated charge density, error < 1e-6
+  [PASS] WireFormatValidatesMagic            — magic "ZCMP" and count field correct
+  [PASS] DecompressRejectsBadMagic           — bad magic returns false
+  [PASS] DecompressRejectsWrongCount         — count mismatch returns false
+  [PASS] RejectsTooSmallBuffer               — buffer < header_size returns false
+
+Compression Ratio by Data Pattern (64^3 grid):
+----------------------------------------------------------------------
+  Pattern    |  Raw Size  |  Compressed  |  Ratio
+----------------------------------------------------------------------
+  zeros      |   2.0 MB   |    0.00 MB   |   0.1%
+  constant   |   2.0 MB   |    0.00 MB   |   0.1%
+  smooth     |   2.0 MB   |    0.89 MB   |  44.7%
+  random     |   2.0 MB   |    1.91 MB   |  95.4%
+----------------------------------------------------------------------
+
+Compression Performance Baseline (serial, zlib BEST_COMPRESSION):
+----------------------------------------------------------------------
+  Grid    |  Raw Size   |  Compressed  |  Time (ms)  |  Throughput (MB/s)
+----------------------------------------------------------------------
+  64^3    |    2.0 MB   |    0.9 MB    |    173.94   |   11.50
+  128^3   |   16.0 MB   |   10.3 MB    |   2060.88   |    7.76
+  256^3   |  128.0 MB   |   97.2 MB    |  17130.35   |    7.47
+----------------------------------------------------------------------
+
+Summary: 13/13 tests PASSED (all ranks)
