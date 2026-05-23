@@ -146,6 +146,14 @@ if(BUILD_TESTING)
   endif()
 endif()
 
+# Async I/O module: provides double-buffered asynchronous file I/O
+# that overlaps I/O operations with computation.
+add_subdirectory(module_async_io)
+
+list(APPEND objects
+    module_async_io/async_io_manager.cpp
+)
+
 if(ENABLE_RAPIDJSON)
   if(ENABLE_MPI)
     add_subdirectory(module_json)
