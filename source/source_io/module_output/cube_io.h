@@ -5,6 +5,10 @@
 #include <string>
 class Parallel_Grid;
 
+#ifdef __MPI
+#include <mpi.h>
+#endif
+
 namespace ModuleIO
 {
 /// read volumetric data from .cube file into the parallel distributed grid.
@@ -60,7 +64,29 @@ void write_cube(const std::string& file,
                 const std::vector<std::vector<double>>& atom_pos,
                 const std::vector<double>& data,
                 const int precision,
-                const int ndata_line = 6);
+                const int ndata_line = 6,
+                const bool compress = false,
+                const int compress_nthreads = 0);
+
+/// MPI-IO parallel cube file write. All ranks must have the full data array.
+/// Each rank writes its z-slice range via collective MPI-IO.
+/// The MPI communicator must be provided.
+#ifdef __MPI
+void write_cube_mpi(const std::string& file,
+                    const std::vector<std::string>& comment,
+                    const int& natom,
+                    const std::vector<double>& origin,
+                    const int& nx, const int& ny, const int& nz,
+                    const std::vector<double>& dx,
+                    const std::vector<double>& dy,
+                    const std::vector<double>& dz,
+                    const std::vector<int>& atom_type,
+                    const std::vector<double>& atom_charge,
+                    const std::vector<std::vector<double>>& atom_pos,
+                    const std::vector<double>& data,
+                    const int precision,
+                    const MPI_Comm& comm);
+#endif
 
 /**
  * @brief The trilinear interpolation method
