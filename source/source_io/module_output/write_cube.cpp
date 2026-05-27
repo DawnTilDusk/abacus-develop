@@ -160,24 +160,55 @@ void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
                                     fac * ucell->atoms[it].tau[ia].z});
             }
         }
-        write_cube(fn,
-                   comment,
-                   ucell->nat,
-                   {0.0, 0.0, 0.0},
-                   nx,
-                   ny,
-                   nz,
-                   dx,
-                   dy,
-                   dz,
-                   atom_type,
-                   atom_charge,
-                   atom_pos,
-                   data_xyz_full,
-                   precision);
+        // ================================================================
+        // 异步 I/O 集成点 (题目4)
+        //
+        // 如果 AsyncIOManager 已启动 (start() 被调用过)，
+        // 则将数据提交到后台 I/O 线程，主线程立即返回；
+        // 否则回退到原有同步写入行为 (向后兼容)。
+        //
+        // 这样设计的好处:
+        //   1. 所有已有的 write_vdata_palgrid 调用方无需任何修改
+        //   2. 可通过在程序入口调用 start()/stop() 来启停异步 I/O
+        //   3. 在未调用 start() 时行为与原实现完全相同
+        // ================================================================
+        AsyncIOManager& io_mgr = AsyncIOManager::instance();
+        if (io_mgr.is_running())
+        {
+            // ★ 异步路径: 将数据通过 move 转移到 IOBuffer (零拷贝)
+            //         然后提交到后台 I/O 工作线程
+            //         主线程不等待，立即返回继续计算
+            IOBuffer buf = IOBuffer::make_cube_write(std::move(data_xyz_full),
+                                                      fn, is, istep, precision);
+            buf.set_cube_header(comment, ucell->nat,
+                                std::vector<double>{0.0, 0.0, 0.0},
+                                nx, ny, nz,
+                                dx, dy, dz,
+                                atom_type, atom_charge, atom_pos);
+            io_mgr.submit_cube_write(std::move(buf));
+        }
+        else
+        {
+            // ★ 同步回退路径: 与原有行为完全一致
+            write_cube(fn,
+                       comment,
+                       ucell->nat,
+                       {0.0, 0.0, 0.0},
+                       nx,
+                       ny,
+                       nz,
+                       dx,
+                       dy,
+                       dz,
+                       atom_type,
+                       atom_charge,
+                       atom_pos,
+                       data_xyz_full,
+                       precision);
 
-        end = time(nullptr);
-        ModuleBase::GlobalFunc::OUT_TIME("write_vdata_palgrid", start, end);
+            end = time(nullptr);
+            ModuleBase::GlobalFunc::OUT_TIME("write_vdata_palgrid", start, end);
+        }
     }
 
     return;

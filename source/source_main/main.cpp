@@ -9,6 +9,13 @@
 #include "source_io/parse_args.h"
 #include "source_io/module_parameter/parameter.h"
 #include "source_main/version.h"
+
+// ============================================================================
+// 异步 I/O 支持 (题目4: 异步 I/O 与计算重叠)
+// 通过独立 I/O 工作线程使文件写入与主计算线程重叠执行
+// ============================================================================
+#include "source_io/module_async_io/async_io_manager.h"
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -84,12 +91,27 @@ int main(int argc, char** argv)
     /*
     main program for doing electronic structure calculations.
     */
+
+    // ================================================================
+    // 启动异步 I/O 管理器
+    // 所有后续 write_vdata_palgrid 调用将自动使用后台 I/O 线程
+    // 主计算线程无需等待文件写入完成
+    // ================================================================
+    AsyncIOManager::instance().start(4);
+
     Driver DD;
     DD.init();
 
     /*
     After running mpi version of abacus, release the mpi resources.
     */
+
+    // ================================================================
+    // 等待所有异步 I/O 任务完成，然后停止 I/O 工作线程
+    // ================================================================
+    AsyncIOManager::instance().wait_all();
+    AsyncIOManager::instance().stop();
+
 #ifdef __MPI
     Parallel_Global::finalize_mpi();
 #endif
