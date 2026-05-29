@@ -15,6 +15,9 @@ Charge::~Charge()
 {
     delete[] rec;
     delete[] dis;
+    delete[] chgmpi_tmp_;
+    delete[] chgmpi_tot_;
+    delete[] chgmpi_tot_aux_;
 }
 
 auto sum_array = [](const double* v, const int& nv) {
@@ -74,6 +77,7 @@ TEST_F(ChargeMpiTest, reduce_diff_pools1)
         rhopw->initgrids(lat0, latvec, 40);
         rhopw->initparameters(false, 10);
         rhopw->setuptransform();
+        charge->rhopw = rhopw;
 
         int nz = rhopw->nz;
         const int nrxx = rhopw->nrxx;

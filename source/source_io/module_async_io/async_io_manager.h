@@ -112,6 +112,24 @@ class AsyncIOManager
     /// @return true 表示提交成功, false 表示队列满
     bool submit_task(std::unique_ptr<IIOTask> task);
 
+    /// @brief 提交一个 rhog 二进制读取任务
+    /// @param buf  包含文件路径和预分配空间的缓冲区
+    /// @return true 表示提交成功, false 表示队列满
+    bool submit_rhog_read(IOBuffer&& buf);
+
+    // ======================== 读取结果获取 ========================
+
+    /// @brief 获取一个已完成的任务 (如果队列非空)
+    /// @return 已完成任务的缓冲区, 如果无已完成任务则返回空 IOBuffer
+    IOBuffer pop_completed();
+
+    /// @brief 等待并获取下一个已完成的任务 (阻塞直到有任务完成)
+    /// @return 已完成任务的缓冲区
+    IOBuffer wait_next_completed();
+
+    /// @brief 获取已完成任务数 (非阻塞查询)
+    size_t completed_count() const;
+
     // ======================== 性能统计 ========================
 
     /// @brief 获取总提交任务数
@@ -146,9 +164,12 @@ class AsyncIOManager
     size_t max_queue_size_ = 4;                         ///< 队列最大容量
 
     // ---- 同步原语 ----
-    mutable std::mutex queue_mutex_;         ///< 保护 task_queue_ 的并发访问
-    std::condition_variable cv_;             ///< 任务到达通知
+    mutable std::mutex queue_mutex_;         ///< 保护 task_queue_ 和 completed_queue_ 的并发访问
+    std::condition_variable cv_;             ///< 任务到达 / 完成通知
     std::atomic<size_t> in_flight_tasks_{0}; ///< 正在执行(已出队但未完成)的任务数
+
+    // ---- 完成队列 (I/O 工作线程写入, 主线程消费) ----
+    std::queue<IOBuffer> completed_queue_;   ///< 已完成任务的缓冲区队列
 
     // ---- 性能统计 ----
     std::atomic<size_t> stats_total_submitted_{0};   ///< 总提交任务数

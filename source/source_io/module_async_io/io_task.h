@@ -271,4 +271,168 @@ class CubeReadTask : public IIOTask
     IOBuffer buf_;
 };
 
+// ============================================================================
+// RhogReadTask: 从 QE 兼容二进制重启文件读取电荷密度数据
+//
+// 文件格式 (与 Quantum ESPRESSO 的 write_rhog 兼容):
+//
+//   /3/            -- int: 3 (大小标记)
+//   gamma_only     -- int: 0 或 1
+//   ngm_g          -- int: 总 G 向量数
+//   nspin          -- int: 自旋数
+//   /3/            -- int: 3 (大小标记)
+//   /9/            -- int: 9 (大小标记)
+//   b1[0..2]       -- 3 doubles: 倒格矢 1
+//   b2[0..2]       -- 3 doubles: 倒格矢 2
+//   b3[0..2]       -- 3 doubles: 倒格矢 3
+//   /9/            -- int: 9 (大小标记)
+//   /3*ngm_g/      -- int: 3*ngm_g (大小标记)
+//   miller[0..3*ngm_g-1] -- 3*ngm_g ints: Miller 指数
+//   /3*ngm_g/      -- int: 3*ngm_g (大小标记)
+//   [对每个自旋:]
+//     /ngm_g/      -- int: ngm_g (大小标记)
+//     rhog[0..ngm_g-1] -- ngm_g complex<double>: 电荷密度
+//     /ngm_g/      -- int: ngm_g (大小标记)
+//
+// 工作流程:
+//   1. I/O 工作线程读取文件的全部原始二进制数据
+//   2. 解析头 (gamma_only, npwtot, nspin, b1/b2/b3)
+//   3. 读取 Miller 索引
+//   4. 将所有自旋的复数数据按自旋顺序读入 data_ (交错实部/虚部)
+//   5. 主线程通过 buffer() 获取结果并进行 G 向量映射
+// ============================================================================
+
+/// @brief 二进制 rhog 读取任务 (在 I/O 工作线程中执行)
+class RhogReadTask : public IIOTask
+{
+  public:
+    explicit RhogReadTask(IOBuffer&& buf)
+        : buf_(std::move(buf))
+    {
+    }
+
+    bool execute() override
+    {
+        if (buf_.filename().empty())
+        {
+            buf_.set_error("RhogReadTask: empty filename");
+            return false;
+        }
+
+        // 以二进制模式打开文件
+        FILE* fp = std::fopen(buf_.filename().c_str(), "rb");
+        if (!fp)
+        {
+            buf_.set_error("RhogReadTask: cannot open file " + buf_.filename());
+            return false;
+        }
+
+        // ---- 读取头部: /3/ gamma_only npwtot nspin /3/ ----
+        int marker = 0;
+        int gamma_only = 0, npwtot = 0, nspin_file = 0;
+
+        if (std::fread(&marker, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "header marker 1"); }
+        if (std::fread(&gamma_only, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "gamma_only"); }
+        if (std::fread(&npwtot, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "npwtot"); }
+        if (std::fread(&nspin_file, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "nspin"); }
+        if (std::fread(&marker, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "header marker 2"); }
+
+        // ---- 读取倒格矢: /9/ b1 b2 b3 /9/ ----
+        double b1[3], b2[3], b3[3];
+        if (std::fread(&marker, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "b marker 1"); }
+        if (std::fread(b1, sizeof(double), 3, fp) != 3) { return read_fail_close(fp, "b1"); }
+        if (std::fread(b2, sizeof(double), 3, fp) != 3) { return read_fail_close(fp, "b2"); }
+        if (std::fread(b3, sizeof(double), 3, fp) != 3) { return read_fail_close(fp, "b3"); }
+        if (std::fread(&marker, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "b marker 2"); }
+
+        // ---- 读取 Miller 指数 ----
+        int miller_count = 0;
+        if (std::fread(&miller_count, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "miller count marker"); }
+
+        int expected_miller = 3 * npwtot;
+        if (miller_count != expected_miller)
+        {
+            std::string err = "RhogReadTask: miller count mismatch (expected "
+                              + std::to_string(expected_miller) + ", got "
+                              + std::to_string(miller_count) + ")";
+            buf_.set_error(err);
+            std::fclose(fp);
+            return false;
+        }
+
+        std::vector<int> miller(miller_count);
+        if (std::fread(miller.data(), sizeof(int), miller_count, fp) != static_cast<size_t>(miller_count))
+        {
+            return read_fail_close(fp, "miller data");
+        }
+
+        // 读取尾部标记
+        int end_marker = 0;
+        if (std::fread(&end_marker, sizeof(int), 1, fp) != 1) { return read_fail_close(fp, "miller end marker"); }
+
+        // ---- 读取所有自旋的 rhog 数据 ----
+        // data_ 中存储: [spin0 的复数据交替实部/虚部] [spin1 ...]
+        // 每个自旋: npwtot 个 complex<double> = 2 * npwtot 个 double
+        std::vector<double> all_data;
+        all_data.reserve(static_cast<size_t>(nspin_file) * 2 * npwtot);
+
+        for (int is = 0; is < nspin_file; ++is)
+        {
+            int spin_marker = 0;
+            if (std::fread(&spin_marker, sizeof(int), 1, fp) != 1)
+            {
+                return read_fail_close(fp, "spin marker " + std::to_string(is));
+            }
+
+            // 读取 npwtot 个复数 = 2*npwtot 个 double
+            std::vector<double> spin_data(static_cast<size_t>(2) * npwtot);
+            size_t items_read = std::fread(spin_data.data(), sizeof(double),
+                                           static_cast<size_t>(2) * npwtot, fp);
+            if (items_read != static_cast<size_t>(2) * npwtot)
+            {
+                std::string err = "RhogReadTask: short read at spin "
+                                  + std::to_string(is) + " (expected "
+                                  + std::to_string(2 * npwtot) + " doubles, got "
+                                  + std::to_string(items_read) + ")";
+                buf_.set_error(err);
+                std::fclose(fp);
+                return false;
+            }
+
+            all_data.insert(all_data.end(), spin_data.begin(), spin_data.end());
+
+            // 读取尾部标记
+            if (std::fread(&spin_marker, sizeof(int), 1, fp) != 1)
+            {
+                return read_fail_close(fp, "spin end marker " + std::to_string(is));
+            }
+        }
+
+        std::fclose(fp);
+
+        // ---- 将结果存入 IOBuffer ----
+        buf_.set_rhog_result(gamma_only, npwtot, nspin_file,
+                             b1, b2, b3, std::move(miller), std::move(all_data));
+
+        return true;
+    }
+
+    IOBuffer& buffer() override { return buf_; }
+    const IOBuffer& buffer() const override { return buf_; }
+    std::string task_name() const override { return "RhogRead"; }
+
+  private:
+    IOBuffer buf_;
+
+    /// @brief 读取失败时关闭文件并设置错误消息
+    bool read_fail_close(FILE* fp, const std::string& what)
+    {
+        std::string err = "RhogReadTask: failed to read " + what
+                          + " from " + buf_.filename();
+        buf_.set_error(err);
+        std::fclose(fp);
+        return false;
+    }
+};
+
 #endif // IO_TASK_H

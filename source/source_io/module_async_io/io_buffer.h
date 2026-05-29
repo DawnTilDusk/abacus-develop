@@ -40,6 +40,14 @@ class IOBuffer
           precision_(other.precision_),
           is_binary_(other.is_binary_),
           error_message_(std::move(other.error_message_)),
+          // ---- rhog 读取元数据 ----
+          npwtot_in_(other.npwtot_in_),
+          gamma_only_in_(other.gamma_only_in_),
+          nspin_in_(other.nspin_in_),
+          b1_(std::move(other.b1_)),
+          b2_(std::move(other.b2_)),
+          b3_(std::move(other.b3_)),
+          miller_(std::move(other.miller_)),
           // ---- Cube 文件头信息 ----
           comment_(std::move(other.comment_)),
           natom_(other.natom_),
@@ -61,6 +69,9 @@ class IOBuffer
         other.is_binary_ = false;
         other.natom_ = 0;
         other.nx_ = other.ny_ = other.nz_ = 0;
+        other.npwtot_in_ = 0;
+        other.gamma_only_in_ = 0;
+        other.nspin_in_ = 0;
     }
 
     /// @brief 允许 move 赋值
@@ -75,6 +86,15 @@ class IOBuffer
             precision_ = other.precision_;
             is_binary_ = other.is_binary_;
             error_message_ = std::move(other.error_message_);
+            // ---- rhog 读取元数据 ----
+            npwtot_in_ = other.npwtot_in_;
+            gamma_only_in_ = other.gamma_only_in_;
+            nspin_in_ = other.nspin_in_;
+            b1_ = std::move(other.b1_);
+            b2_ = std::move(other.b2_);
+            b3_ = std::move(other.b3_);
+            miller_ = std::move(other.miller_);
+            // ---- Cube 文件头信息 ----
             comment_ = std::move(other.comment_);
             natom_ = other.natom_;
             origin_ = std::move(other.origin_);
@@ -94,6 +114,9 @@ class IOBuffer
             other.is_binary_ = false;
             other.natom_ = 0;
             other.nx_ = other.ny_ = other.nz_ = 0;
+            other.npwtot_in_ = 0;
+            other.gamma_only_in_ = 0;
+            other.nspin_in_ = 0;
         }
         return *this;
     }
@@ -147,6 +170,19 @@ class IOBuffer
         return buf;
     }
 
+    /// @brief 创建一个 rhog 二进制读取缓冲区
+    /// @param fn  二进制重启文件路径
+    /// @param npw 进程本地 G 向量数 (用于留出 data_ 空间)
+    static IOBuffer make_binary_read_result(const std::string& fn, int npw)
+    {
+        IOBuffer buf;
+        buf.filename_ = fn;
+        buf.is_binary_ = true;
+        // 预分配空间: 每个 G 向量一个复数 (2 doubles)
+        buf.data_.reserve(2 * npw);
+        return buf;
+    }
+
     // ======================== Cube 头信息设置 ========================
 
     /// @brief 设置 Cube 文件头信息 (在 submit 前由主线程填充)
@@ -191,6 +227,36 @@ class IOBuffer
     void set_error(const std::string& msg) { error_message_ = msg; }
     bool has_error() const { return !error_message_.empty(); }
 
+    // ======================== Rhog 二进制读取访问器 ========================
+
+    /// @brief 设置 rhog 读取结果 (由 RhogReadTask 在工作线程中调用)
+    void set_rhog_result(int gamma_only,
+                         int npwtot,
+                         int nspin_file,
+                         const double b1[3],
+                         const double b2[3],
+                         const double b3[3],
+                         std::vector<int>&& miller,
+                         std::vector<double>&& data)
+    {
+        gamma_only_in_ = gamma_only;
+        npwtot_in_ = npwtot;
+        nspin_in_ = nspin_file;
+        b1_.assign(b1, b1 + 3);
+        b2_.assign(b2, b2 + 3);
+        b3_.assign(b3, b3 + 3);
+        miller_ = std::move(miller);
+        data_ = std::move(data);
+    }
+
+    int gamma_only_in() const { return gamma_only_in_; }
+    int npwtot_in() const { return npwtot_in_; }
+    int nspin_in() const { return nspin_in_; }
+    const std::vector<double>& b1() const { return b1_; }
+    const std::vector<double>& b2() const { return b2_; }
+    const std::vector<double>& b3() const { return b3_; }
+    const std::vector<int>& miller() const { return miller_; }
+
     // Cube 头访问器
     const std::vector<std::string>& comment() const { return comment_; }
     int natom() const { return natom_; }
@@ -222,6 +288,13 @@ class IOBuffer
 
     // ---- 错误状态 ----
     std::string error_message_;         ///< 如果非空，表示 I/O 操作失败了
+
+    // ---- Rhog 二进制读取元数据 (在 RhogReadTask 中由 I/O 线程填充) ----
+    int npwtot_in_ = 0;                  ///< 文件中的总 G 向量数
+    int gamma_only_in_ = 0;              ///< 文件是否仅 Gamma 点
+    int nspin_in_ = 0;                   ///< 文件中的自旋数
+    std::vector<double> b1_, b2_, b3_;   ///< 倒格矢 (各 3 个 double)
+    std::vector<int> miller_;            ///< Miller 指数 [3 * npwtot_in_]
 
     // ---- Cube 文件头信息 (仅在 write_cube 场景使用) ----
     std::vector<std::string> comment_;           ///< 文件注释行 (2行)

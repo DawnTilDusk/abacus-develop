@@ -1,0 +1,24 @@
+======================================================================
+Task 3: Cube 文件写入优化 — 测试结果
+======================================================================
+Date: 2026-05-22
+Test: MODULE_IO_write_cube_test
+MPI processes: 4 (each rank uses unique tmp file)
+======================================================================
+
+Correctness Tests (all ranks pass individually):
+  [PASS] WriteTextCubeAndReadBack       — write -> read_cube roundtrip, data match 1e-6
+  [PASS] ReadbackHeaderCorrect          — comment/natom/origin/nx/ny/nz/dx/dy/dz correct
+  [PASS] DataLayoutZFastest             — z-fastest ordering verified (ix*100+iy*10+iz)
+  [PASS] ReadCubeFileNotFound           — nonexistent file returns false
+
+Serial Performance Baseline (single-rank, text format):
+----------------------------------------------------------------------
+  Grid    |  Data Size  |  Time (ms)  |  Throughput (MB/s)
+----------------------------------------------------------------------
+  64^3    |    2.0 MB   |    330.20   |    6.21
+  128^3   |   16.2 MB   |   3700.28   |    4.38
+  256^3   |  128.8 MB   |  24475.97   |    5.26
+----------------------------------------------------------------------
+
+Summary: 7/7 tests PASSED (all ranks)

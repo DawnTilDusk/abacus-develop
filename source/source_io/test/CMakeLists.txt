@@ -73,7 +73,7 @@ AddTest(
 	../../source_base/parallel_common.cpp
 	../../source_base/parallel_global.cpp
   ../../source_base/parallel_comm.cpp
-  ../../source_base/tool_quit.cpp ../../source_base/global_file.cpp ../../source_base/global_function.cpp ../../source_base/memory.cpp ../../source_base/timer.cpp
+  ../../source_base/tool_quit.cpp ../../source_base/global_file.cpp ../../source_base/global_function.cpp ../../source_base/memory_recorder.cpp ../../source_base/timer.cpp
 )
 
 AddTest(
@@ -284,6 +284,39 @@ AddTest(
   ../../source_basis/module_nao/radial_collection.cpp
 )
 endif()
+
+AddTest(
+  TARGET MODULE_IO_write_cube_test
+  LIBS parameter ${math_libs} base device planewave z
+  SOURCES write_cube_test.cpp ../module_output/write_cube.cpp ../module_output/read_cube.cpp ../module_output/charge_compress.cpp ../../source_pw/module_pwdft/parallel_grid.cpp ../../source_basis/module_pw/test/test_tool.cpp
+)
+
+add_test(NAME MODULE_IO_write_cube_test_parallel
+      COMMAND mpirun -np 4 ./MODULE_IO_write_cube_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+AddTest(
+  TARGET MODULE_IO_charge_compression_test
+  LIBS parameter ${math_libs} base device z planewave
+  SOURCES charge_compression_test.cpp ../module_output/charge_compress.cpp ../module_output/write_cube.cpp ../module_output/read_cube.cpp ../../source_pw/module_pwdft/parallel_grid.cpp ../../source_basis/module_pw/test/test_tool.cpp
+)
+
+add_test(NAME MODULE_IO_charge_compression_test_parallel
+      COMMAND mpirun -np 4 ./MODULE_IO_charge_compression_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+AddTest(
+  TARGET MODULE_IO_read_rhog_mpi_test
+  LIBS parameter ${math_libs} base device planewave
+  SOURCES read_rhog_mpi_test.cpp ../module_chgpot/rhog_io.cpp ../module_output/binstream.cpp ../../source_basis/module_pw/test/test_tool.cpp
+)
+
+add_test(NAME MODULE_IO_read_rhog_mpi_test_parallel
+      COMMAND mpirun -np 4 ./MODULE_IO_read_rhog_mpi_test
+      WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
 
 AddTest(
   TARGET MODULE_IO_write_elf_logic_test

@@ -115,6 +115,50 @@ bool AsyncIOManager::submit_binary_write(IOBuffer&& buf)
     return submit_task(std::move(task));
 }
 
+bool AsyncIOManager::submit_rhog_read(IOBuffer&& buf)
+{
+    auto task = std::unique_ptr<IIOTask>(
+        new RhogReadTask(std::move(buf)));
+    return submit_task(std::move(task));
+}
+
+// ==================================================================
+// 3. 读取结果获取
+// ==================================================================
+
+IOBuffer AsyncIOManager::pop_completed()
+{
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (completed_queue_.empty())
+    {
+        return IOBuffer(); // 空缓冲区
+    }
+    IOBuffer result = std::move(completed_queue_.front());
+    completed_queue_.pop();
+    return result;
+}
+
+IOBuffer AsyncIOManager::wait_next_completed()
+{
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    cv_.wait(lock, [this]() {
+        return !completed_queue_.empty() || !running_.load();
+    });
+    if (completed_queue_.empty())
+    {
+        return IOBuffer(); // 管理器已停止, 无结果
+    }
+    IOBuffer result = std::move(completed_queue_.front());
+    completed_queue_.pop();
+    return result;
+}
+
+size_t AsyncIOManager::completed_count() const
+{
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return completed_queue_.size();
+}
+
 bool AsyncIOManager::submit_task(std::unique_ptr<IIOTask> task)
 {
     if (!running_.load())
@@ -200,6 +244,12 @@ void AsyncIOManager::io_loop()
                           << ": " << buf.error_message() << std::endl;
             }
 
+            // 将已完成任务的缓冲区推入完成队列 (主线程通过 pop_completed 消费)
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                completed_queue_.push(std::move(current_task->buffer()));
+            }
+
             // 更新统计
             stats_total_completed_.fetch_add(1);
 
@@ -207,7 +257,7 @@ void AsyncIOManager::io_loop()
             in_flight_tasks_.fetch_sub(1);
         }
 
-        // 唤醒可能正在 wait_all 的主线程
+        // 唤醒可能正在 wait_all 或 wait_next_completed 中的主线程
         cv_.notify_all();
     }
 }

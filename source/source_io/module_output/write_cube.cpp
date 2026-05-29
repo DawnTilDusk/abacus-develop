@@ -2,6 +2,7 @@
 #include "source_base/parallel_comm.h"
 #include "source_pw/module_pwdft/parallel_grid.h"
 #include "source_io/module_output/cube_io.h"
+#include "source_io/module_output/charge_compress.h"
 #include "source_io/module_parameter/parameter.h"
 
 #include <vector>
@@ -229,7 +230,9 @@ void ModuleIO::write_cube(const std::string& file,
                           const std::vector<std::vector<double>>& atom_pos,
                           const std::vector<double>& data,
                           const int precision,
-                          const int ndata_line)
+                          const int ndata_line,
+                          const bool compress,
+                          const int compress_nthreads)
 {
     assert(comment.size() >= 2);
     for (int i = 0; i < 2; ++i)
@@ -278,25 +281,188 @@ void ModuleIO::write_cube(const std::string& file,
             << atom_pos[i][2] << "\n";
     }
 
-    ofs.unsetf(std::ofstream::fixed);
-    ofs << std::setprecision(precision);
-    ofs << std::scientific;
-    const int nxy = nx * ny;
-    for (int ixy = 0; ixy < nxy; ++ixy)
+    if (compress)
     {
-        for (int iz = 0; iz < nz; ++iz)
+        // Write compressed binary data section
+        ofs.close();
+
+        // Compress the data
+        size_t nxyz = static_cast<size_t>(nx) * ny * nz;
+        std::vector<uint8_t> cbuf;
+        bool ok = false;
+        if (compress_nthreads > 1)
         {
-            ofs << " " << data[ixy * nz + iz];
-            if ((iz + 1) % ndata_line == 0 && iz != nz - 1)
-            {
-                ofs << "\n";
-            }
+            ok = compress_charge_data_omp(data.data(), nxyz, cbuf, compress_nthreads);
         }
-        ofs << "\n";
+        else
+        {
+            ok = compress_charge_data(data.data(), nxyz, cbuf);
+        }
+
+        if (!ok)
+        {
+            ModuleBase::WARNING_QUIT("ModuleIO::write_cube",
+                                     "Failed to compress charge data");
+            return;
+        }
+
+        // Append compressed binary blob to the file
+        std::ofstream ofs_bin(file, std::ios::binary | std::ios::app);
+        ofs_bin.write(reinterpret_cast<const char*>(cbuf.data()), cbuf.size());
+        ofs_bin.close();
     }
-    ofs.close();
+    else
+    {
+        ofs.unsetf(std::ofstream::fixed);
+        ofs << std::setprecision(precision);
+        ofs << std::scientific;
+        const int nxy = nx * ny;
+        for (int ixy = 0; ixy < nxy; ++ixy)
+        {
+            for (int iz = 0; iz < nz; ++iz)
+            {
+                ofs << " " << data[ixy * nz + iz];
+                if ((iz + 1) % ndata_line == 0 && iz != nz - 1)
+                {
+                    ofs << "\n";
+                }
+            }
+            ofs << "\n";
+        }
+        ofs.close();
+    }
 }
 
+#ifdef __MPI
+
+// Binary marker to identify MPI-parallel binary cube files
+// "CIPM" = Cube I/O Parallel Marker (little-endian)
+static constexpr uint32_t CUBE_MPI_MARKER = 0x4D504943;
+
+void ModuleIO::write_cube_mpi(const std::string& file,
+                               const std::vector<std::string>& comment,
+                               const int& natom,
+                               const std::vector<double>& origin,
+                               const int& nx,
+                               const int& ny,
+                               const int& nz,
+                               const std::vector<double>& dx,
+                               const std::vector<double>& dy,
+                               const std::vector<double>& dz,
+                               const std::vector<int>& atom_type,
+                               const std::vector<double>& atom_charge,
+                               const std::vector<std::vector<double>>& atom_pos,
+                               const std::vector<double>& data,
+                               const int precision,
+                               const MPI_Comm& comm)
+{
+    assert(comment.size() >= 2);
+    assert(origin.size() >= 3);
+    assert(data.size() >= static_cast<size_t>(nx) * ny * nz);
+
+    int nprocs = 1;
+    int my_rank = 0;
+    MPI_Comm_size(comm, &nprocs);
+    MPI_Comm_rank(comm, &my_rank);
+
+    const int nxy = nx * ny;
+
+    // Compute z-slice distribution across ranks
+    int nz_local = nz / nprocs;
+    int remainder = nz % nprocs;
+    int z_start = 0;
+    for (int r = 0; r < my_rank; ++r)
+    {
+        z_start += nz_local + (r < remainder ? 1 : 0);
+    }
+    if (my_rank < remainder)
+        nz_local += 1;
+
+    const int my_count = nz_local * nxy;
+
+    // Build the text header string (rank 0 only) — identical to standard cube header
+    std::string header_str;
+    size_t header_bytes = 0;
+
+    if (my_rank == 0)
+    {
+        std::ostringstream hdr;
+        hdr << std::fixed;
+
+        for (int i = 0; i < 2; ++i)
+            hdr << comment[i] << "\n";
+
+        hdr << std::setprecision(1);
+        hdr << natom << " " << origin[0] << " " << origin[1] << " " << origin[2] << " \n";
+
+        hdr << std::setprecision(6);
+        hdr << nx << " " << dx[0] << " " << dx[1] << " " << dx[2] << "\n";
+        hdr << ny << " " << dy[0] << " " << dy[1] << " " << dy[2] << "\n";
+        hdr << nz << " " << dz[0] << " " << dz[1] << " " << dz[2] << "\n";
+
+        for (int i = 0; i < natom; ++i)
+        {
+            hdr << " " << atom_type[i] << " " << atom_charge[i] << " "
+                << atom_pos[i][0] << " " << atom_pos[i][1] << " " << atom_pos[i][2] << "\n";
+        }
+
+        header_str = hdr.str();
+        header_bytes = header_str.size();
+    }
+
+    MPI_Bcast(&header_bytes, 1, MPI_UNSIGNED_LONG, 0, comm);
+
+    // Open file with MPI-IO
+    MPI_File fh;
+    MPI_File_open(comm, file.c_str(),
+                  MPI_MODE_WRONLY | MPI_MODE_CREATE,
+                  MPI_INFO_NULL, &fh);
+
+    // Rank 0 writes the text header + binary marker
+    if (my_rank == 0)
+    {
+        MPI_File_write_at(fh, 0, header_str.data(), static_cast<int>(header_bytes),
+                          MPI_CHAR, MPI_STATUS_IGNORE);
+        // Write binary marker so readers can detect MPI-parallel binary format
+        MPI_File_write_at(fh, static_cast<MPI_Offset>(header_bytes),
+                          &CUBE_MPI_MARKER, 1, MPI_UINT32_T, MPI_STATUS_IGNORE);
+    }
+
+    // Barrier to ensure header is written before data
+    MPI_Barrier(comm);
+
+    // Each rank writes its z-slice data using MPI file views for correct
+    // z-fastest ordering. File layout: for each ixy, all nz values
+    // consecutively. Each rank writes its nz_local values within each nz block.
+    MPI_Offset data_offset = static_cast<MPI_Offset>(header_bytes) + sizeof(uint32_t);
+
+    // Create strided file view: for each ixy row, this rank writes nz_local
+    // values with a stride of nz (skipping data written by other ranks).
+    MPI_Datatype filetype;
+    MPI_Type_vector(nxy, nz_local, nz, MPI_DOUBLE, &filetype);
+    MPI_Type_commit(&filetype);
+
+    // Set file view: the view starts at this rank's z offset within each block
+    MPI_File_set_view(fh, data_offset + z_start * sizeof(double),
+                      MPI_DOUBLE, filetype, "native", MPI_INFO_NULL);
+
+    // Pack local buffer in row-major order matching the file view
+    std::vector<double> buf(my_count);
+    for (int ixy = 0; ixy < nxy; ++ixy)
+    {
+        for (int iz = 0; iz < nz_local; ++iz)
+        {
+            buf[ixy * nz_local + iz] = data[ixy * nz + (z_start + iz)];
+        }
+    }
+
+    MPI_File_write_all(fh, buf.data(), my_count, MPI_DOUBLE, MPI_STATUS_IGNORE);
+    MPI_Type_free(&filetype);
+
+    MPI_File_close(&fh);
+}
+
+<<<<<<< HEAD
 // ============================================================================
 // 异步版本: write_vdata_palgrid_async
 //
@@ -504,3 +670,6 @@ void ModuleIO::write_vdata_palgrid_async(const Parallel_Grid& pgrid,
     // ---- 步骤3: 非写入进程直接返回 (无需等待 I/O 完成) ----
     return;
 }
+=======
+#endif
+>>>>>>> origin/develop

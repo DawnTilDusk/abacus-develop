@@ -4,7 +4,7 @@
 - 配套头文件：[charge.h](file:///root/homework/abacus-develop/source/source_estate/module_charge/charge.h#L126-L176)
 - 这份文件只做一件核心事情：**把不同 pool / band 上分散的电荷密度** **`rho`** **或动能密度** **`kin_r`** **做 MPI 归约**。
 
-**先记住 4 个核心概念**
+**4 个核心概念**
 
 - `rho[is]`：某个自旋通道在**当前进程本地**持有的实空间电荷密度数组。
 - `nrxx`：当前进程本地拥有的网格点数。

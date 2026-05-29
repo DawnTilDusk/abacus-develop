@@ -1,4 +1,5 @@
 #include "source_io/module_output/cube_io.h"
+#include "source_io/module_output/charge_compress.h"
 #include <limits>
 #include "source_pw/module_pwdft/parallel_grid.h"
 #include <cstring>  // use std::memcpy
@@ -198,9 +199,67 @@ bool ModuleIO::read_cube(const std::string& file,
 
     const int nxyz = nx * ny * nz;
     data.resize(nxyz);
-    for (int i = 0;i < nxyz;++i) 
-    { 
-	    ifs >> data[i]; 
+
+    // Record position after header to detect compression / binary format.
+    // Text data starts with digit/minus/dot.
+    // Compressed data starts with 'Z' (first byte of "ZCMP" magic in LE).
+    // MPI binary data starts with 'C' (first byte of "CIPM" marker in LE).
+    ifs >> std::ws;
+    std::streampos data_start = ifs.tellg();
+    int next_char = ifs.peek();
+
+    // Attempt compressed read (ZCMP magic)
+    if (next_char == 'Z' || next_char == 'C')
+    {
+        ifs.close();
+
+        std::ifstream ifs_bin(file, std::ios::binary | std::ios::ate);
+        size_t file_size = ifs_bin.tellg();
+        size_t header_size = static_cast<size_t>(data_start);
+        size_t raw_len = (file_size > header_size) ? (file_size - header_size) : 0;
+
+        if (raw_len >= 4)
+        {
+            std::vector<uint8_t> raw_buf(raw_len);
+            ifs_bin.seekg(data_start);
+            ifs_bin.read(reinterpret_cast<char*>(raw_buf.data()), raw_len);
+            ifs_bin.close();
+
+            uint32_t magic = 0;
+            std::memcpy(&magic, raw_buf.data(), 4);
+
+            // Check for zlib-compressed data (ZCMP magic)
+            if (magic == CHARGE_COMPRESS_MAGIC)
+            {
+                bool ok = decompress_charge_data(raw_buf.data(), raw_len, data.data(), nxyz);
+                if (!ok)
+                    ok = decompress_charge_data_omp(raw_buf.data(), raw_len, data.data(), nxyz);
+                if (ok)
+                    return true;
+            }
+
+            // Check for MPI-parallel binary data (CIPM marker)
+            static constexpr uint32_t CUBE_MPI_MARKER = 0x4D504943;
+            if (magic == CUBE_MPI_MARKER)
+            {
+                // MPI binary format: 4B marker + nxyz * sizeof(double)
+                size_t expected_size = 4 + static_cast<size_t>(nxyz) * sizeof(double);
+                if (raw_len >= expected_size)
+                {
+                    std::memcpy(data.data(), raw_buf.data() + 4, nxyz * sizeof(double));
+                    return true;
+                }
+            }
+        }
+
+        // Fallback: reopen as text and parse
+        ifs.open(file);
+        ifs.seekg(data_start);
+    }
+
+    for (int i = 0;i < nxyz;++i)
+    {
+	    ifs >> data[i];
     }
 
     ifs.close();

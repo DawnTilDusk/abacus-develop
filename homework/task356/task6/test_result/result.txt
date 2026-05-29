@@ -1,0 +1,25 @@
+======================================================================
+Task 6: 电荷密度读取 MPI-IO 并行化 — 测试结果
+======================================================================
+Date: 2026-05-22
+Test: MODULE_IO_read_rhog_mpi_test
+Reference file: support/charge-density.dat
+MPI processes: 4
+======================================================================
+
+Correctness Tests:
+  [PASS] ReadThenWriteThenReadRoundtrip    — read reference -> write temp -> no crash
+  [PASS] RepeatedReadsYieldSameResult       — two reads yield identical data (all ranks)
+  [PASS] MissingFileWarningWritten          — missing file emits warning, returns false
+
+Serial Performance Baseline (read_rhog, reference file):
+----------------------------------------------------------------------
+  Test               |  Time (ms)  |  Throughput (MB/s)  |  np
+----------------------------------------------------------------------
+  ReadRhog_Serial    |    86.52    |      0.46           |   4
+----------------------------------------------------------------------
+
+Note: ReferenceDataFirstElementsCorrect 已在 read_rhog_test.cpp 中覆盖，
+       此处不再重复。MPI-IO 并行读取的基准测试预留。
+
+Summary: 4/4 tests PASSED (all ranks)
