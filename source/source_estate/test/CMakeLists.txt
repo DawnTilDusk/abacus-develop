@@ -97,9 +97,9 @@ AddTest(
 
 AddTest(
   TARGET MODULE_ESTATE_charge_extra
-  LIBS parameter  ${math_libs} base device cell_info 
+  LIBS parameter  ${math_libs} base device cell_info async_io z
   SOURCES charge_extra_test.cpp ../module_charge/charge_extra.cpp ../../source_io/module_output/read_cube.cpp ../../source_io/module_output/write_cube.cpp
-  ../../source_io/module_output/output.cpp ../../source_base/module_fft/fft_bundle.cpp ../../source_base/module_fft/fft_cpu.cpp
+  ../../source_io/module_output/charge_compress.cpp ../../source_io/module_output/output.cpp ../../source_base/module_fft/fft_bundle.cpp ../../source_base/module_fft/fft_cpu.cpp
 )
 
 AddTest(

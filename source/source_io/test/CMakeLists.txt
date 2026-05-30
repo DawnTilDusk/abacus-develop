@@ -287,7 +287,7 @@ endif()
 
 AddTest(
   TARGET MODULE_IO_write_cube_test
-  LIBS parameter ${math_libs} base device planewave z
+  LIBS parameter ${math_libs} base device planewave z async_io
   SOURCES write_cube_test.cpp ../module_output/write_cube.cpp ../module_output/read_cube.cpp ../module_output/charge_compress.cpp ../../source_pw/module_pwdft/parallel_grid.cpp ../../source_basis/module_pw/test/test_tool.cpp
 )
 
@@ -298,7 +298,7 @@ add_test(NAME MODULE_IO_write_cube_test_parallel
 
 AddTest(
   TARGET MODULE_IO_charge_compression_test
-  LIBS parameter ${math_libs} base device z planewave
+  LIBS parameter ${math_libs} base device z planewave async_io
   SOURCES charge_compression_test.cpp ../module_output/charge_compress.cpp ../module_output/write_cube.cpp ../module_output/read_cube.cpp ../../source_pw/module_pwdft/parallel_grid.cpp ../../source_basis/module_pw/test/test_tool.cpp
 )
 
