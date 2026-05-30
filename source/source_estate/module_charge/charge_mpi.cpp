@@ -46,12 +46,18 @@ void Charge::reorder_pool_to_uniform(const double* array_tot, double* array_tot_
 void Charge::reorder_pool_rank_to_uniform(const double* array_tot, double* array_tot_aux, const int ip) const
 {
     const int ncxy = this->rhopw->nx * this->rhopw->ny;
+    const int numz_ip = this->rhopw->numz[ip];
+    const int startz_ip = this->rhopw->startz[ip];
+    const int nz = this->rhopw->nz;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int ir = 0; ir < ncxy; ++ir)
     {
-        for (int iz = 0; iz < this->rhopw->numz[ip]; ++iz)
+        for (int iz = 0; iz < numz_ip; ++iz)
         {
-            array_tot_aux[this->rhopw->nz * ir + this->rhopw->startz[ip] + iz]
-                = array_tot[this->rhopw->numz[ip] * ir + this->rhopw->startz[ip] * ncxy + iz];
+            array_tot_aux[nz * ir + startz_ip + iz]
+                = array_tot[numz_ip * ir + startz_ip * ncxy + iz];
         }
     }
 }
@@ -59,12 +65,18 @@ void Charge::reorder_pool_rank_to_uniform(const double* array_tot, double* array
 void Charge::extract_uniform_to_local(const double* array_tot, double* array_rho) const
 {
     const int ncxy = this->rhopw->nx * this->rhopw->ny;
+    const int numz_local = this->rhopw->numz[GlobalV::RANK_IN_POOL];
+    const int startz_local = this->rhopw->startz_current;
+    const int nz = this->rhopw->nz;
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int ir = 0; ir < ncxy; ir++)
     {
-        for (int iz = 0; iz < this->rhopw->numz[GlobalV::RANK_IN_POOL]; iz++)
+        for (int iz = 0; iz < numz_local; iz++)
         {
-            array_rho[this->rhopw->numz[GlobalV::RANK_IN_POOL] * ir + iz]
-                = array_tot[this->rhopw->nz * ir + this->rhopw->startz_current + iz];
+            array_rho[numz_local * ir + iz]
+                = array_tot[nz * ir + startz_local + iz];
         }
     }
 }
