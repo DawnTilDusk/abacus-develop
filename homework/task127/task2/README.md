@@ -13,8 +13,10 @@
 | 阶段 5 extract OpenMP 化 | [stage5_extract_openmp.md](./stage5_extract_openmp.md) | ✅ 完成 |
 | 阶段 6 系统化边界测试 | [stage6_boundary_tests.md](./stage6_boundary_tests.md) | ✅ 完成 |
 | 阶段 7 性能测试 + Amdahl | [stage7_performance.md](./stage7_performance.md) | ✅ 完成 |
+| 阶段 8 DataTransformFunc 抽象（加分） | — | ⏸ 跳过 |
+| 阶段 9 OpenMP × MPI 组合最终回归 | [stage9_regression.md](./stage9_regression.md) | ✅ 完成 |
 
-## 阶段 1 ~ 7 一句话总结
+## 阶段 1 ~ 9 一句话总结
 
 1. **阶段 1**：在不改代码的前提下，跑通题目一现有的 `MODULE_ESTATE_charge_mpi_test`（np=1 与 np=4），4/4 测试全过，作为题目二的对照基线，并明确 OpenMP 宏当前被 `remove_definitions` 抹掉的事实。
 2. **阶段 2**：新建独立目录 `source/source_estate/test_omp/`，注册 target `MODULE_ESTATE_charge_omp_test` + ctest 入口 `MODULE_ESTATE_charge_omp_test_4np`。**不动**题目一目录任何文件，由 `USE_OPENMP` 条件挂载。最小空壳测试 `ChargeOmpSkeleton.OpenMPMacroEnabled` 验证 `_OPENMP` 宏在新 target 中已启用。题目一原 target 重新编译 + 4np 跑测，仍全过。
@@ -23,6 +25,8 @@
 5. **阶段 5**：对称地把 `extract_uniform_to_local` 也做 OpenMP 化（同样 `collapse(2) schedule(static)` + `#ifdef _OPENMP`），新增 `ChargeOmpExtract.MatchesSerialReferenceForEachRank` 测试模拟 `GlobalV::RANK_IN_POOL` 与 `startz_current`，覆盖 `numz=[3,1,0,4]` 含空 slab 的不均匀切分。`threads=1/4` 全过，题目一原 target 仍全过。
 6. **阶段 6**：补齐 `ChargeOmpBoundary` 套件 5 个边界测试：`ReorderNcxyOne / ExtractNcxyOne`（`ncxy=1`）、`ReorderWithZeroSlabRank`（`numz=[0,1,...]`）、`ReorderSingleRankPool`（nproc=1）以及最关键的 `ReorderThreadCountInvariance`（`omp_set_num_threads(1/2/4)` 三轮逐字节一致）。题目二总测试数升至 9/9，题目一仍 4/4。
 7. **阶段 7**：新增 `ChargeOmpPerf.ReorderAndExtractSpeedup` 性能 benchmark（128³ 网格，`CHARGE_OMP_BENCH=1` 启用，默认 skip）。3 次取中位数：reorder 在 t=2 加速 1.20×、extract 加速 1.83×；t=4/8 因机器只有 2 逻辑核出现过度订阅而退化。Amdahl 反推 `f_reorder ≈ 0.33`、`f_extract ≈ 0.91`，与跨步 vs 连续写下标的特征一致。日常 ctest 仍 9 过 1 skip；题目一 4 进程仍全过。
+8. **阶段 8**：DataTransformFunc 抽象作为加分项，未做（不影响主线交付）。
+9. **阶段 9**：跑 4 种 OpenMP × MPI 正交组合（OFF/np=1、OFF/np=4、ON+threads=4/np=1、ON+threads=2/np=4），全部通过。MPI + OpenMP 混合下 4 ranks × 9 PASSED + 4 ranks × 1 SKIPPED；题目二 / 题目一 同时部署、互不破坏。
 
 ## 改动汇总（代码层面，截至阶段 7）
 
@@ -52,5 +56,5 @@ mpirun -np 4 ./source/source_estate/test_mpi/MODULE_ESTATE_charge_mpi_test
 
 ## 接下来要做的事
 
-- 阶段 8（加分项）：抽象 `DataTransformFunc`
-- 阶段 9：四种 OpenMP × MPI 组合的回归验证
+- 题目二主线交付完成 ✅
+- 可选：阶段 8（加分项 `DataTransformFunc` 抽象）
