@@ -146,10 +146,13 @@ target_include_directories(
 
 # Propagate async_io include directories to io_basic
 # (needed because write_cube.cpp includes async_io_manager.h)
+# ZLIB is required by charge_compress.cpp
+find_package(ZLIB REQUIRED)
 target_link_libraries(
     io_basic
     PUBLIC
     async_io
+    ZLIB::ZLIB
 )
 
 add_library(

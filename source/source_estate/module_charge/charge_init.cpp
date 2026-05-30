@@ -9,6 +9,7 @@
 #include "source_base/math_integral.h"
 #include "source_base/math_sphbes.h"
 #include "source_base/parallel_reduce.h"
+#include "source_base/parallel_comm.h"
 #include "source_base/timer.h"
 #include "source_base/tool_threading.h"
 #include "source_estate/magnetism.h"
@@ -432,8 +433,7 @@ void Charge::init_rho(const UnitCell& ucell,
                             break;
                         }
                     }
-                    ModuleBase::timer::end("Charge", "init_rho_tau_cube");   }
-                    }
+                    ModuleBase::timer::end("Charge", "init_rho_tau_cube");
                 }
             }
             else

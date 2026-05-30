@@ -462,7 +462,6 @@ void ModuleIO::write_cube_mpi(const std::string& file,
     MPI_File_close(&fh);
 }
 
-<<<<<<< HEAD
 // ============================================================================
 // 异步版本: write_vdata_palgrid_async
 //
@@ -670,6 +669,4 @@ void ModuleIO::write_vdata_palgrid_async(const Parallel_Grid& pgrid,
     // ---- 步骤3: 非写入进程直接返回 (无需等待 I/O 完成) ----
     return;
 }
-=======
 #endif
->>>>>>> origin/develop
