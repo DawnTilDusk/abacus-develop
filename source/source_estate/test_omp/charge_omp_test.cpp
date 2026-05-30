@@ -22,6 +22,9 @@
 #include "source_hamilt/module_xc/xc_functional.h"
 #include "source_io/module_parameter/parameter.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -552,6 +555,111 @@ TEST(ChargeOmpBoundary, ReorderThreadCountInvariance)
     }
 
     omp_set_num_threads(saved_threads);
+
+    charge.rhopw = nullptr;
+    destroy_stub_pw_basis(pw);
+}
+
+// =============================================================================
+// Stage 7: Performance benchmark (gated by CHARGE_OMP_BENCH=1 env var).
+// Reports wall-clock time over OMP_NUM_THREADS = 1, 2, 4, 8 for both
+// reorder_pool_rank_to_uniform and extract_uniform_to_local on a large grid,
+// so the user can read off speedup and fit Amdahl's law in the report.
+//
+// We skip by default so the regular ctest invocation stays fast.
+// =============================================================================
+TEST(ChargeOmpPerf, ReorderAndExtractSpeedup)
+{
+    const char* env = std::getenv("CHARGE_OMP_BENCH");
+    if (env == nullptr || std::string(env) != "1")
+    {
+        GTEST_SKIP() << "Set CHARGE_OMP_BENCH=1 to enable the perf benchmark.";
+    }
+
+    const int nx = 128;
+    const int ny = 128;
+    const int nz = 128;
+    const int nproc = 4;
+    const int slab = nz / nproc; // 32
+    std::vector<int> layout_numz(nproc, slab);
+    std::vector<int> layout_startz(nproc, 0);
+    for (int ip = 1; ip < nproc; ++ip)
+    {
+        layout_startz[ip] = layout_startz[ip - 1] + layout_numz[ip - 1];
+    }
+
+    auto* pw = make_stub_pw_basis(nx, ny, nz, layout_numz, layout_startz);
+    Charge charge;
+    charge.rhopw = pw;
+
+    const int ncxy = nx * ny;
+    const int nxyz = ncxy * nz;
+    std::vector<double> array_tot(nxyz);
+    std::mt19937 rng(909u);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (int i = 0; i < nxyz; ++i)
+    {
+        array_tot[i] = dist(rng);
+    }
+
+    std::vector<double> out(nxyz, 0.0);
+
+    const int saved_threads = omp_get_max_threads();
+    const int saved_rank = GlobalV::RANK_IN_POOL;
+
+    const int thread_counts[] = {1, 2, 4, 8};
+    const int repeats = 5;
+
+    std::printf("\n[ChargeOmpPerf] grid=%dx%dx%d (nxyz=%d), nproc=%d, repeats=%d\n",
+                nx, ny, nz, nxyz, nproc, repeats);
+    std::printf("[ChargeOmpPerf] %-8s %-18s %-18s\n",
+                "threads", "reorder_ms_avg", "extract_ms_avg");
+
+    for (int t : thread_counts)
+    {
+        omp_set_num_threads(t);
+
+        // warm-up to avoid the first-touch / thread-pool-spawn artifact
+        for (int ip = 0; ip < nproc; ++ip)
+        {
+            charge.reorder_pool_rank_to_uniform(array_tot.data(), out.data(), ip);
+        }
+
+        double reorder_ms = 0.0;
+        for (int r = 0; r < repeats; ++r)
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int ip = 0; ip < nproc; ++ip)
+            {
+                charge.reorder_pool_rank_to_uniform(array_tot.data(), out.data(), ip);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            reorder_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        reorder_ms /= repeats;
+
+        double extract_ms = 0.0;
+        for (int r = 0; r < repeats; ++r)
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int ip = 0; ip < nproc; ++ip)
+            {
+                GlobalV::RANK_IN_POOL = ip;
+                pw->startz_current = layout_startz[ip];
+                std::vector<double> rho(layout_numz[ip] * ncxy, 0.0);
+                charge.extract_uniform_to_local(array_tot.data(), rho.data());
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            extract_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        extract_ms /= repeats;
+
+        std::printf("[ChargeOmpPerf] %-8d %-18.3f %-18.3f\n",
+                    t, reorder_ms, extract_ms);
+    }
+
+    omp_set_num_threads(saved_threads);
+    GlobalV::RANK_IN_POOL = saved_rank;
 
     charge.rhopw = nullptr;
     destroy_stub_pw_basis(pw);
