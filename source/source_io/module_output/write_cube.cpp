@@ -2,6 +2,7 @@
 #include "source_base/parallel_comm.h"
 #include "source_pw/module_pwdft/parallel_grid.h"
 #include "source_io/module_output/cube_io.h"
+#include "source_io/module_output/charge_compress.h"
 
 #include <vector>
 
@@ -191,7 +192,9 @@ void ModuleIO::write_cube(const std::string& file,
                           const std::vector<std::vector<double>>& atom_pos,
                           const std::vector<double>& data,
                           const int precision,
-                          const int ndata_line)
+                          const int ndata_line,
+                          const bool compress,
+                          const int compress_nthreads)
 {
     assert(comment.size() >= 2);
     for (int i = 0; i < 2; ++i)
@@ -240,21 +243,54 @@ void ModuleIO::write_cube(const std::string& file,
             << atom_pos[i][2] << "\n";
     }
 
-    ofs.unsetf(std::ofstream::fixed);
-    ofs << std::setprecision(precision);
-    ofs << std::scientific;
-    const int nxy = nx * ny;
-    for (int ixy = 0; ixy < nxy; ++ixy)
+    if (compress)
     {
-        for (int iz = 0; iz < nz; ++iz)
+        // Write compressed binary data section
+        ofs.close();
+
+        // Compress the data
+        size_t nxyz = static_cast<size_t>(nx) * ny * nz;
+        std::vector<uint8_t> cbuf;
+        bool ok = false;
+        if (compress_nthreads > 1)
         {
-            ofs << " " << data[ixy * nz + iz];
-            if ((iz + 1) % ndata_line == 0 && iz != nz - 1)
-            {
-                ofs << "\n";
-            }
+            ok = compress_charge_data_omp(data.data(), nxyz, cbuf, compress_nthreads);
         }
-        ofs << "\n";
+        else
+        {
+            ok = compress_charge_data(data.data(), nxyz, cbuf);
+        }
+
+        if (!ok)
+        {
+            ModuleBase::WARNING_QUIT("ModuleIO::write_cube",
+                                     "Failed to compress charge data");
+            return;
+        }
+
+        // Append compressed binary blob to the file
+        std::ofstream ofs_bin(file, std::ios::binary | std::ios::app);
+        ofs_bin.write(reinterpret_cast<const char*>(cbuf.data()), cbuf.size());
+        ofs_bin.close();
     }
-    ofs.close();
+    else
+    {
+        ofs.unsetf(std::ofstream::fixed);
+        ofs << std::setprecision(precision);
+        ofs << std::scientific;
+        const int nxy = nx * ny;
+        for (int ixy = 0; ixy < nxy; ++ixy)
+        {
+            for (int iz = 0; iz < nz; ++iz)
+            {
+                ofs << " " << data[ixy * nz + iz];
+                if ((iz + 1) % ndata_line == 0 && iz != nz - 1)
+                {
+                    ofs << "\n";
+                }
+            }
+            ofs << "\n";
+        }
+        ofs.close();
+    }
 }

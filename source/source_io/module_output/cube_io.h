@@ -61,7 +61,9 @@ void write_cube(const std::string& file,
                 const std::vector<std::vector<double>>& atom_pos,
                 const std::vector<double>& data,
                 const int precision,
-                const int ndata_line = 6);
+                const int ndata_line = 6,
+                const bool compress = false,
+                const int compress_nthreads = 0);
 
 /**
  * @brief The trilinear interpolation method

@@ -31,6 +31,7 @@ list(APPEND objects
     module_wf/write_wfc_pw.cpp
     module_output/write_pao.cpp
     module_output/write_cube.cpp
+    module_output/charge_compress.cpp
     module_chgpot/write_elecstat_pot.cpp
     module_elf/write_elf.cpp
     module_dipole/write_dipole.cpp
