@@ -4,6 +4,10 @@
 #include <string>
 #include <cassert>
 #include "source_basis/module_pw/pw_basis.h"
+
+#ifdef __MPI
+#include <mpi.h>
+#endif
 /**
  * I/O free function of rho(G) in binary format
  * Author: YuLiu98, Kirk0830
@@ -44,6 +48,13 @@ namespace ModuleIO
 {
 
 bool read_rhog(const std::string& filename, const ModulePW::PW_Basis* pw_rhod, std::complex<double>** rhog);
+
+#ifdef __MPI
+/// Read rhog using MPI-IO collective read (replaces serial-read + Bcast pattern).
+/// All ranks in the communicator read the file simultaneously via MPI-IO.
+bool read_rhog_mpi(const std::string& filename, const ModulePW::PW_Basis* pw_rhod,
+                   std::complex<double>** rhog, MPI_Comm comm);
+#endif
 
 bool write_rhog(const std::string& fchg,
                 const bool gamma_only,            // from INPUT
