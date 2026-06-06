@@ -899,9 +899,9 @@ if(NOT MSVC)
 endif()
 target_link_libraries(${ABACUS_BIN_NAME} ${math_libs})
 
-# ZLIB is required by charge_compress.cpp (in io_basic OBJECT library).
-# find_package(ZLIB) already called in source/source_io/CMakeLists.txt;
-# OBJECT libraries cannot propagate link dependencies, so link ZLIB here.
+# ZLIB is required by charge_compress.cpp (compiled into io_basic OBJECT library).
+# OBJECT libraries cannot propagate link dependencies to final targets.
+find_package(ZLIB REQUIRED)
 target_link_libraries(${ABACUS_BIN_NAME} ZLIB::ZLIB)
 
 install(PROGRAMS ${ABACUS_BIN_PATH}
