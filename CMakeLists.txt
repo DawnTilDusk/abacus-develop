@@ -900,6 +900,12 @@ if(NOT MSVC)
   list(APPEND math_libs m)
 endif()
 target_link_libraries(${ABACUS_BIN_NAME} ${math_libs})
+find_package(ZLIB REQUIRED)
+if(TARGET ZLIB::ZLIB)
+  target_link_libraries(${ABACUS_BIN_NAME} ZLIB::ZLIB)
+else()
+  target_link_libraries(${ABACUS_BIN_NAME} ${ZLIB_LIBRARIES})
+endif()
 
 install(PROGRAMS ${ABACUS_BIN_PATH}
         TYPE BIN
