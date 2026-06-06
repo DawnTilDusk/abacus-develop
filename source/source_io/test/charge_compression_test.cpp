@@ -5,6 +5,8 @@
 #undef private
 
 #include "source_base/global_variable.h"
+#include "source_io/module_output/charge_compress.h"
+#include "source_io/module_output/cube_io.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,12 +23,16 @@
 #include "mpi.h"
 #endif
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /**
  * Tested: charge density compression via zlib.
  *
  * The compression API (to be integrated into write_cube / read_rhog):
- *   - compress_charge_data(const double* src, size_t n, std::vector<uint8_t>& dst)
- *   - decompress_charge_data(const uint8_t* src, size_t src_len,
+ *   - ModuleIO::compress_charge_data(const double* src, size_t n, std::vector<uint8_t>& dst)
+ *   - ModuleIO::decompress_charge_data(const uint8_t* src, size_t src_len,
  *                             double* dst, size_t n)
  *
  * Wire format: [magic:4B "ZCMP"] [original_count:8B] [compressed payload]
@@ -44,60 +50,9 @@
  *   - Bench_Compress_OpenMP_nthreads{N}
  */
 
-// -------------------------------------------------------------------
-// Compression / decompression reference implementation (zlib)
-// -------------------------------------------------------------------
-
-constexpr uint32_t COMPRESS_MAGIC = 0x504D435A; // "ZCMP" little-endian
-constexpr size_t HEADER_SIZE = 12;               // 4B magic + 8B original_count
-
-static bool compress_charge_data(const double* src, size_t n, std::vector<uint8_t>& dst)
-{
-    dst.clear();
-    dst.resize(HEADER_SIZE);
-
-    // write magic
-    std::memcpy(dst.data(), &COMPRESS_MAGIC, 4);
-
-    // write original element count
-    uint64_t count = static_cast<uint64_t>(n);
-    std::memcpy(dst.data() + 4, &count, 8);
-
-    uLongf src_len = static_cast<uLongf>(n * sizeof(double));
-    uLongf bound = compressBound(src_len);
-    std::vector<uint8_t> cbuf(bound);
-
-    int ret = compress2(cbuf.data(), &bound,
-                        reinterpret_cast<const Bytef*>(src), src_len,
-                        Z_BEST_COMPRESSION);
-    if (ret != Z_OK)
-        return false;
-
-    dst.insert(dst.end(), cbuf.begin(), cbuf.begin() + bound);
-    return true;
-}
-
-static bool decompress_charge_data(const uint8_t* src, size_t src_len,
-                                   double* dst, size_t n)
-{
-    if (src_len < HEADER_SIZE)
-        return false;
-
-    uint32_t magic = 0;
-    std::memcpy(&magic, src, 4);
-    if (magic != COMPRESS_MAGIC)
-        return false;
-
-    uint64_t count = 0;
-    std::memcpy(&count, src + 4, 8);
-    if (count != static_cast<uint64_t>(n))
-        return false;
-
-    uLongf dst_len = static_cast<uLongf>(n * sizeof(double));
-    int ret = uncompress(reinterpret_cast<Bytef*>(dst), &dst_len,
-                         src + HEADER_SIZE, src_len - HEADER_SIZE);
-    return ret == Z_OK;
-}
+// ===========================================================================
+// Compression / decompression now provided by ModuleIO::charge_compress
+// ===========================================================================
 
 // -------------------------------------------------------------------
 // Data generators
@@ -176,11 +131,11 @@ TEST_F(ChargeCompressionTest, CompressDecompressRoundtrip_Small)
     auto original = gen_random(n, 123);
 
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
-    EXPECT_GT(compressed.size(), HEADER_SIZE);
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
+    EXPECT_GT(compressed.size(), ModuleIO::CHARGE_COMPRESS_HEADER_SIZE);
 
     std::vector<double> restored(n, -999.0);
-    ASSERT_TRUE(decompress_charge_data(compressed.data(), compressed.size(),
+    ASSERT_TRUE(ModuleIO::decompress_charge_data(compressed.data(), compressed.size(),
                                        restored.data(), n));
 
     for (size_t i = 0; i < n; ++i)
@@ -195,7 +150,7 @@ TEST_F(ChargeCompressionTest, AllZerosCompressesWell)
     auto original = gen_all_zeros(n);
 
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
 
     // all-zero should compress to much less than original size
     size_t raw_size = n * sizeof(double);
@@ -203,7 +158,7 @@ TEST_F(ChargeCompressionTest, AllZerosCompressesWell)
         << "all-zero data should achieve high compression";
 
     std::vector<double> restored(n, -1.0);
-    ASSERT_TRUE(decompress_charge_data(compressed.data(), compressed.size(),
+    ASSERT_TRUE(ModuleIO::decompress_charge_data(compressed.data(), compressed.size(),
                                        restored.data(), n));
     for (size_t i = 0; i < n; ++i)
         EXPECT_DOUBLE_EQ(0.0, restored[i]);
@@ -215,14 +170,14 @@ TEST_F(ChargeCompressionTest, ConstantDataCompressesWell)
     auto original = gen_constant(n, 3.14159);
 
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
 
     size_t raw_size = n * sizeof(double);
     EXPECT_LT(compressed.size(), raw_size / 10)
         << "constant data should achieve high compression";
 
     std::vector<double> restored(n);
-    ASSERT_TRUE(decompress_charge_data(compressed.data(), compressed.size(),
+    ASSERT_TRUE(ModuleIO::decompress_charge_data(compressed.data(), compressed.size(),
                                        restored.data(), n));
     for (size_t i = 0; i < n; ++i)
         EXPECT_NEAR(original[i], restored[i], kTolerance);
@@ -234,11 +189,11 @@ TEST_F(ChargeCompressionTest, RandomDataRoundtrip)
     auto original = gen_random(n, 77);
 
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
 
     // random data may not compress well, but should still be valid
     std::vector<double> restored(n);
-    ASSERT_TRUE(decompress_charge_data(compressed.data(), compressed.size(),
+    ASSERT_TRUE(ModuleIO::decompress_charge_data(compressed.data(), compressed.size(),
                                        restored.data(), n));
     for (size_t i = 0; i < n; ++i)
         EXPECT_NEAR(original[i], restored[i], kTolerance);
@@ -249,14 +204,14 @@ TEST_F(ChargeCompressionTest, SmoothGaussianDataRoundtrip)
     auto original = gen_smooth_gaussian(20, 20, 20); // n=8000
 
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), original.size(), compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), original.size(), compressed));
 
     size_t raw_size = original.size() * sizeof(double);
     EXPECT_LT(compressed.size(), raw_size * 2 / 3)
         << "smooth data should achieve moderate compression";
 
     std::vector<double> restored(original.size());
-    ASSERT_TRUE(decompress_charge_data(compressed.data(), compressed.size(),
+    ASSERT_TRUE(ModuleIO::decompress_charge_data(compressed.data(), compressed.size(),
                                        restored.data(), original.size()));
     for (size_t i = 0; i < original.size(); ++i)
         EXPECT_NEAR(original[i], restored[i], kTolerance);
@@ -267,12 +222,12 @@ TEST_F(ChargeCompressionTest, WireFormatValidatesMagic)
     size_t n = 100;
     auto original = gen_random(n, 1);
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
 
     // check magic
     uint32_t magic = 0;
     std::memcpy(&magic, compressed.data(), 4);
-    EXPECT_EQ(magic, COMPRESS_MAGIC);
+    EXPECT_EQ(magic, ModuleIO::CHARGE_COMPRESS_MAGIC);
 
     // check count field
     uint64_t count = 0;
@@ -282,9 +237,9 @@ TEST_F(ChargeCompressionTest, WireFormatValidatesMagic)
 
 TEST_F(ChargeCompressionTest, DecompressRejectsBadMagic)
 {
-    std::vector<uint8_t> bad(HEADER_SIZE + 10, 0xFF);
+    std::vector<uint8_t> bad(ModuleIO::CHARGE_COMPRESS_HEADER_SIZE + 10, 0xFF);
     double dst[10];
-    EXPECT_FALSE(decompress_charge_data(bad.data(), bad.size(), dst, 10));
+    EXPECT_FALSE(ModuleIO::decompress_charge_data(bad.data(), bad.size(), dst, 10));
 }
 
 TEST_F(ChargeCompressionTest, DecompressRejectsWrongCount)
@@ -292,11 +247,11 @@ TEST_F(ChargeCompressionTest, DecompressRejectsWrongCount)
     size_t n = 100;
     auto original = gen_random(n, 1);
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
 
     // try to decompress with wrong element count
     std::vector<double> restored(200);
-    EXPECT_FALSE(decompress_charge_data(compressed.data(), compressed.size(),
+    EXPECT_FALSE(ModuleIO::decompress_charge_data(compressed.data(), compressed.size(),
                                         restored.data(), 200));
 }
 
@@ -305,11 +260,11 @@ TEST_F(ChargeCompressionTest, RejectsTooSmallBuffer)
     size_t n = 100;
     auto original = gen_random(n, 1);
     std::vector<uint8_t> compressed;
-    ASSERT_TRUE(compress_charge_data(original.data(), n, compressed));
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, compressed));
 
     // buffer smaller than header
     double small_buf[1];
-    EXPECT_FALSE(decompress_charge_data(compressed.data(), 4, small_buf, n));
+    EXPECT_FALSE(ModuleIO::decompress_charge_data(compressed.data(), 4, small_buf, n));
 }
 
 // ===================================================================
@@ -335,7 +290,7 @@ TEST_F(ChargeCompressionTest, Bench_Compress_Small_64)
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> compressed;
     for (int r = 0; r < repeat; ++r)
-        compress_charge_data(data.data(), data.size(), compressed);
+        ModuleIO::compress_charge_data(data.data(), data.size(), compressed);
     auto t1 = std::chrono::high_resolution_clock::now();
     long long t = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
@@ -352,7 +307,7 @@ TEST_F(ChargeCompressionTest, Bench_Compress_Medium_128)
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> compressed;
     for (int r = 0; r < repeat; ++r)
-        compress_charge_data(data.data(), data.size(), compressed);
+        ModuleIO::compress_charge_data(data.data(), data.size(), compressed);
     auto t1 = std::chrono::high_resolution_clock::now();
     long long t = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
@@ -369,7 +324,7 @@ TEST_F(ChargeCompressionTest, Bench_Compress_Large_256)
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> compressed;
     for (int r = 0; r < repeat; ++r)
-        compress_charge_data(data.data(), data.size(), compressed);
+        ModuleIO::compress_charge_data(data.data(), data.size(), compressed);
     auto t1 = std::chrono::high_resolution_clock::now();
     long long t = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
@@ -397,7 +352,7 @@ TEST_F(ChargeCompressionTest, Bench_CompressRatioByPattern)
     for (auto& c : cases)
     {
         std::vector<uint8_t> compressed;
-        compress_charge_data(c.data.data(), n, compressed);
+        ModuleIO::compress_charge_data(c.data.data(), n, compressed);
         double cmb = static_cast<double>(compressed.size()) / 1048576.0;
         double ratio = cmb / data_mb;
         printf("[BENCH] CompressRatio_%-12s  size=%6.1f MB -> %6.2f MB  ratio=%5.1f%%\n",
@@ -405,9 +360,270 @@ TEST_F(ChargeCompressionTest, Bench_CompressRatioByPattern)
     }
 }
 
-// === Reserved slots for OpenMP parallel compression benchmarks ===
-// TEST_F(ChargeCompressionTest, Bench_Compress_OpenMP_nthreads4) { ... }
-// TEST_F(ChargeCompressionTest, Bench_Compress_OpenMP_nthreads8) { ... }
+// ===================================================================
+// OpenMP parallel compression tests
+// ===================================================================
+
+TEST_F(ChargeCompressionTest, OmpCompressDecompressRoundtrip)
+{
+    size_t n = 100000;
+    auto original = gen_random(n, 456);
+
+    int nthreads = 0;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+    if (nthreads < 2)
+        nthreads = 2;
+#else
+    nthreads = 1;
+#endif
+
+    std::vector<uint8_t> compressed;
+    ASSERT_TRUE(ModuleIO::compress_charge_data_omp(original.data(), n, compressed, nthreads));
+    EXPECT_GT(compressed.size(), 0u);
+
+    std::vector<double> restored(n, -999.0);
+    ASSERT_TRUE(ModuleIO::decompress_charge_data_omp(compressed.data(), compressed.size(),
+                                                     restored.data(), n));
+
+    for (size_t i = 0; i < n; ++i)
+        EXPECT_NEAR(original[i], restored[i], kTolerance) << "mismatch at " << i;
+}
+
+TEST_F(ChargeCompressionTest, OmpCompressSameAsSerial)
+{
+    size_t n = 50000;
+    auto original = gen_random(n, 789);
+
+    std::vector<uint8_t> c_serial;
+    ASSERT_TRUE(ModuleIO::compress_charge_data(original.data(), n, c_serial));
+
+    int nthreads = 0;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+    if (nthreads < 2)
+        nthreads = 2;
+#else
+    nthreads = 1;
+#endif
+
+    std::vector<uint8_t> c_omp;
+    ASSERT_TRUE(ModuleIO::compress_charge_data_omp(original.data(), n, c_omp, nthreads));
+
+    // Both should decompress to the same data, even if wire formats differ
+    std::vector<double> r_serial(n), r_omp(n);
+    ASSERT_TRUE(ModuleIO::decompress_charge_data(c_serial.data(), c_serial.size(),
+                                                  r_serial.data(), n));
+    ASSERT_TRUE(ModuleIO::decompress_charge_data_omp(c_omp.data(), c_omp.size(),
+                                                      r_omp.data(), n));
+
+    for (size_t i = 0; i < n; ++i)
+        EXPECT_NEAR(r_serial[i], r_omp[i], kTolerance) << "serial vs OMP mismatch at " << i;
+}
+
+TEST_F(ChargeCompressionTest, OmpAllZerosCompressesWell)
+{
+    size_t n = 100000;
+    auto original = gen_all_zeros(n);
+
+    int nthreads = 4;
+    std::vector<uint8_t> compressed;
+    ASSERT_TRUE(ModuleIO::compress_charge_data_omp(original.data(), n, compressed, nthreads));
+
+    size_t raw_size = n * sizeof(double);
+    EXPECT_LT(compressed.size(), raw_size / 10);
+
+    std::vector<double> restored(n, -1.0);
+    ASSERT_TRUE(ModuleIO::decompress_charge_data_omp(compressed.data(), compressed.size(),
+                                                      restored.data(), n));
+    for (size_t i = 0; i < n; ++i)
+        EXPECT_DOUBLE_EQ(0.0, restored[i]);
+}
+
+// ===================================================================
+// Integration tests with write_cube / read_cube
+// ===================================================================
+
+TEST_F(ChargeCompressionTest, WriteCubeWithCompressionRoundtrip)
+{
+    // Create a small cube file with compression, then read it back
+    std::vector<std::string> comment = {"COMPRESSED_ZLIB TestHeader", "Inner loop is z"};
+    int natom = 1;
+    std::vector<double> origin = {0.0, 0.0, 0.0};
+    int nx = 10, ny = 10, nz = 10;
+    std::vector<double> dx_v = {0.1, 0.0, 0.0};
+    std::vector<double> dy_v = {0.0, 0.1, 0.0};
+    std::vector<double> dz_v = {0.0, 0.0, 0.1};
+    std::vector<int> atom_type = {1};
+    std::vector<double> atom_charge = {1.0};
+    std::vector<std::vector<double>> atom_pos = {{0.0, 0.0, 0.0}};
+
+    int nxyz = nx * ny * nz;
+    std::vector<double> data(nxyz);
+    for (int i = 0; i < nxyz; ++i)
+        data[i] = std::sin(static_cast<double>(i) * 0.01);
+
+    std::string fn = "test_compress_writecube.cube";
+
+    // Write with compression
+    ModuleIO::write_cube(fn, comment, natom, origin, nx, ny, nz,
+                         dx_v, dy_v, dz_v, atom_type, atom_charge, atom_pos,
+                         data, 6, 6, true, 0);
+
+    // Read back
+    std::vector<std::string> cmt;
+    int natom_r = 0;
+    std::vector<double> org_r;
+    int nx_r = 0, ny_r = 0, nz_r = 0;
+    std::vector<double> dx_r(3), dy_r(3), dz_r(3);
+    std::vector<int> atype;
+    std::vector<double> ac;
+    std::vector<std::vector<double>> ap;
+    std::vector<double> rdata;
+
+    bool ok = ModuleIO::read_cube(fn, cmt, natom_r, org_r,
+                                  nx_r, ny_r, nz_r, dx_r, dy_r, dz_r,
+                                  atype, ac, ap, rdata);
+    ASSERT_TRUE(ok);
+
+    EXPECT_EQ(natom, natom_r);
+    EXPECT_EQ(nx, nx_r);
+    EXPECT_EQ(ny, ny_r);
+    EXPECT_EQ(nz, nz_r);
+    ASSERT_EQ(data.size(), rdata.size());
+
+    for (size_t i = 0; i < data.size(); ++i)
+        EXPECT_NEAR(data[i], rdata[i], kTolerance) << "mismatch at " << i;
+
+    std::remove(fn.c_str());
+}
+
+TEST_F(ChargeCompressionTest, AutoDetectCompressedFile)
+{
+    // Write one compressed and one uncompressed file with the same data.
+    // read_cube should correctly handle both.
+    std::vector<std::string> comment = {"Test", "z is fastest"};
+    int natom = 1;
+    std::vector<double> origin = {0.0, 0.0, 0.0};
+    int nx = 8, ny = 8, nz = 8;
+    std::vector<double> dx_v = {1.0/8, 0.0, 0.0};
+    std::vector<double> dy_v = {0.0, 1.0/8, 0.0};
+    std::vector<double> dz_v = {0.0, 0.0, 1.0/8};
+    std::vector<int> atom_type = {8};
+    std::vector<double> atom_charge = {6.0};
+    std::vector<std::vector<double>> atom_pos = {{0.5, 0.5, 0.5}};
+
+    int nxyz = nx * ny * nz;
+    std::vector<double> data(nxyz);
+    for (int i = 0; i < nxyz; ++i)
+        data[i] = std::exp(-static_cast<double>(i) * 0.001);
+
+    std::string fn_cmp = "test_autodetect_comp.cube";
+    std::string fn_txt = "test_autodetect_text.cube";
+
+    // Write compressed
+    ModuleIO::write_cube(fn_cmp, comment, natom, origin, nx, ny, nz,
+                         dx_v, dy_v, dz_v, atom_type, atom_charge, atom_pos,
+                         data, 6, 6, true, 0);
+
+    // Write uncompressed
+    ModuleIO::write_cube(fn_txt, comment, natom, origin, nx, ny, nz,
+                         dx_v, dy_v, dz_v, atom_type, atom_charge, atom_pos,
+                         data, 6, 6, false, 0);
+
+    // Read compressed
+    std::vector<double> rdata_cmp;
+    {
+        std::vector<std::string> cmt;
+        int nr = 0, nxr = 0, nyr = 0, nzr = 0;
+        std::vector<double> org_r, dxr(3), dyr(3), dzr(3);
+        std::vector<int> at;
+        std::vector<double> ac;
+        std::vector<std::vector<double>> ap;
+        ASSERT_TRUE(ModuleIO::read_cube(fn_cmp, cmt, nr, org_r, nxr, nyr, nzr,
+                                         dxr, dyr, dzr, at, ac, ap, rdata_cmp));
+    }
+
+    // Read uncompressed
+    std::vector<double> rdata_txt;
+    {
+        std::vector<std::string> cmt;
+        int nr = 0, nxr = 0, nyr = 0, nzr = 0;
+        std::vector<double> org_r, dxr(3), dyr(3), dzr(3);
+        std::vector<int> at;
+        std::vector<double> ac;
+        std::vector<std::vector<double>> ap;
+        ASSERT_TRUE(ModuleIO::read_cube(fn_txt, cmt, nr, org_r, nxr, nyr, nzr,
+                                         dxr, dyr, dzr, at, ac, ap, rdata_txt));
+    }
+
+    ASSERT_EQ(data.size(), rdata_cmp.size());
+    ASSERT_EQ(data.size(), rdata_txt.size());
+
+    for (size_t i = 0; i < data.size(); ++i)
+    {
+        EXPECT_NEAR(data[i], rdata_cmp[i], kTolerance);
+        EXPECT_NEAR(data[i], rdata_txt[i], kTolerance);
+    }
+
+    std::remove(fn_cmp.c_str());
+    std::remove(fn_txt.c_str());
+}
+
+// ===================================================================
+// OpenMP parallel compression benchmarks
+// ===================================================================
+
+TEST_F(ChargeCompressionTest, Bench_Compress_OMP_nthreads4_256)
+{
+#ifdef _OPENMP
+    auto data = gen_smooth_gaussian(256, 256, 256);
+    double data_mb = static_cast<double>(data.size() * sizeof(double)) / 1048576.0;
+    int repeat = 1;
+    int nthreads = 4;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<uint8_t> compressed;
+    for (int r = 0; r < repeat; ++r)
+        ModuleIO::compress_charge_data_omp(data.data(), data.size(), compressed, nthreads);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    long long t = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    double cmb = static_cast<double>(compressed.size()) / 1048576.0;
+    double ms = static_cast<double>(t) / 1000.0 / repeat;
+    double mbps = data_mb / (ms / 1000.0);
+    printf("[BENCH] Compress_OMP_256_nthreads%-2d   time=%8.2f ms  throughput=%8.2f MB/s  size=%6.1f MB -> %6.1f MB\n",
+           nthreads, ms, mbps, data_mb, cmb);
+#else
+    GTEST_SKIP() << "OpenMP not available";
+#endif
+}
+
+TEST_F(ChargeCompressionTest, Bench_Compress_OMP_Scaling_128)
+{
+#ifdef _OPENMP
+    auto data = gen_smooth_gaussian(128, 128, 128);
+    double data_mb = static_cast<double>(data.size() * sizeof(double)) / 1048576.0;
+    int repeat = 3;
+
+    for (int nthreads : {1, 2, 4, 8})
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::vector<uint8_t> compressed;
+        for (int r = 0; r < repeat; ++r)
+            ModuleIO::compress_charge_data_omp(data.data(), data.size(), compressed, nthreads);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        long long t = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+        double ms = static_cast<double>(t) / 1000.0 / repeat;
+        double mbps = data_mb / (ms / 1000.0);
+        printf("[BENCH] Compress_OMP_128_nthreads%-2d  time=%8.2f ms  throughput=%8.2f MB/s\n",
+               nthreads, ms, mbps);
+    }
+#else
+    GTEST_SKIP() << "OpenMP not available";
+#endif
+}
 
 int main(int argc, char** argv)
 {
