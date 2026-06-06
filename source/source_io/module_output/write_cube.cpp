@@ -30,6 +30,7 @@ void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
                                    const UnitCell* const ucell,
                                    const int precision,
                                    const int out_fermi,
+                                   const bool two_fermi,
                                    const bool reduce_all_pool)
 {
     ModuleBase::TITLE("ModuleIO", "write_vdata_palgrid");
@@ -81,7 +82,7 @@ void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
         ss << nspin << " # number of spin directions ";
         if (out_fermi == 1)
         {
-            if (PARAM.globalv.two_fermi)
+            if (two_fermi)
             {
                 if (is == 0)
                 {
