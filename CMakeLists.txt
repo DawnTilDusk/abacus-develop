@@ -699,6 +699,11 @@ if(ENABLE_MLALGO OR DEFINED Torch_DIR)
   add_compile_options(${TORCH_CXX_FLAGS})
 endif()
 
+# ZLIB is required by charge_compress.cpp (in io_basic OBJECT library)
+# Must be linked to the final target unconditionally, not only when ENABLE_CNPY=ON
+find_package(ZLIB REQUIRED)
+target_link_libraries(${ABACUS_BIN_NAME} ZLIB::ZLIB)
+
 if (ENABLE_CNPY)
   find_path(cnpy_SOURCE_DIR
     cnpy.h
@@ -717,9 +722,7 @@ if (ENABLE_CNPY)
   endif()
   include_directories(${cnpy_SOURCE_DIR})
 
-  # find ZLIB and link
-  find_package(ZLIB REQUIRED)
-  target_link_libraries(${ABACUS_BIN_NAME} cnpy ZLIB::ZLIB)
+  target_link_libraries(${ABACUS_BIN_NAME} cnpy)
   add_compile_definitions(__USECNPY)
 endif()
 
