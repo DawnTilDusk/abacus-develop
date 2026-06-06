@@ -609,25 +609,22 @@ void ModuleIO::write_vdata_palgrid_async(const Parallel_Grid& pgrid,
 
         // ---- ★ 关键变更: 使用异步 I/O 替代直接写入 ----
         //
-        // 1. 先检查异步管理器是否可用 (队列未满)
-        // 2. 如果可用: 将数据通过 move 转移到 IOBuffer，提交到工作线程
-        // 3. 如果不可用: 回退到同步写入 (与原有行为一致)
+        // 策略: 先检查队列是否可提交，再决定是否移动数据
+        //   - 队列有空位: 将 data_xyz_full 通过 move 转移到 IOBuffer，提交到工作线程
+        //   - 队列满: 直接同步写入 (data_xyz_full 未被移动，可以安全使用)
         //
         // 这样可以确保:
-        //   - 数据不丢失 (回退路径直接写入)
+        //   - 数据不丢失 (满时 safe fallback 到同步写入)
         //   - 不阻塞 (异步路径立即返回)
-        //   - 向后兼容 (回退路径与原有实现完全相同)
+        //   - 向后兼容 (同步写入与原有实现完全相同)
         // ----
 
         // 获取异步 I/O 管理器单例
         AsyncIOManager& io_mgr = AsyncIOManager::instance();
 
-        // 检查是否可以使用异步 I/O
-        bool use_async = io_mgr.is_running();
-
-        if (use_async)
+        if (io_mgr.is_running() && io_mgr.can_submit())
         {
-            // ★ 异步路径: 将 data_xyz_full 所有权转移到 IOBuffer (零拷贝)
+            // ★ 异步路径: 队列有空位，将 data_xyz_full 所有权转移到 IOBuffer (零拷贝)
             IOBuffer buf = IOBuffer::make_cube_write(std::move(data_xyz_full),
                                                       fn, is, istep, precision);
 
@@ -638,22 +635,13 @@ void ModuleIO::write_vdata_palgrid_async(const Parallel_Grid& pgrid,
                                 dx, dy, dz,
                                 atom_type, atom_charge, atom_pos);
 
-            // 提交到 I/O 工作线程: 这里 data_xyz_full 已被 move，主线程不再持有
-            bool submitted = io_mgr.submit_cube_write(std::move(buf));
-
-            if (!submitted)
-            {
-                // 异步队列满: 丢失了 data_xyz_full，需要从原始 data 重新归约
-                // 这种情况极少发生，回退到同步写入
-                //
-                // 注意: 由于 data_xyz_full 已被 move, 这里需要通知用户
-                ModuleBase::WARNING("ModuleIO::write_vdata_palgrid_async",
-                                    "Async I/O queue full, data for " + fn + " may be lost");
-            }
+            // 提交到 I/O 工作线程: 此时队列有空位，必定成功
+            io_mgr.submit_cube_write(std::move(buf));
         }
         else
         {
-            // ★ 同步回退路径: 与原有 write_vdata_palgrid 行为一致
+            // ★ 同步回退路径: 队列满或异步 I/O 不可用，直接写入
+            // data_xyz_full 未被移动，可以安全使用
             write_cube(fn,
                        comment,
                        ucell->nat,

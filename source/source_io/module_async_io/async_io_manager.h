@@ -89,6 +89,10 @@ class AsyncIOManager
     /// @brief 检查队列是否为空且没有任务正在执行
     bool is_idle() const;
 
+    /// @brief 检查队列是否有空位可提交 (非阻塞)
+    /// @return true 表示队列未满，可以提交新任务
+    bool can_submit() const;
+
     /// @brief 优雅停止 I/O 工作线程 (等待所有任务完成)
     void stop();
 

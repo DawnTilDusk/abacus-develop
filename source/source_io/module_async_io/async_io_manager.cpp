@@ -60,6 +60,16 @@ bool AsyncIOManager::is_idle() const
     return task_queue_.empty();
 }
 
+bool AsyncIOManager::can_submit() const
+{
+    if (!running_.load())
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return (max_queue_size_ == 0) || (task_queue_.size() < max_queue_size_);
+}
+
 void AsyncIOManager::stop()
 {
     if (!running_.load())
