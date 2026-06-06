@@ -1,170 +1,135 @@
-# Task 5: 电荷密度数据压缩 —— 优化实现报告
+# Task 5: 电荷密度数据压缩 —— 优化实现报告（第二轮）
 
-Date: 2026-05-26
+Date: 2026-06-06
 
 ---
 
-## 一、实现概要
+## 一、本轮优化概要
 
-### 1.1 实际完成内容
+在第一轮（2026-05-26）完成串行 zlib + OpenMP 并行压缩（v0 格式）的基础上，
+本轮引入 v1 线格式，解决格式检测歧义，补齐 OpenMP 并行解压，添加压缩自动回退。
 
-| 步骤 | 内容 | 状态 |
-|------|------|------|
-| Step 1 | 提取压缩/解压函数为独立模块 `charge_compress.h/.cpp` | 完成 |
-| Step 2 | 实现 OpenMP 并行压缩 (`compress_charge_data_omp`) | 完成 |
-| Step 3 | 集成压缩到 `write_cube` 和 `read_cube` | 完成 |
-| Step 4 | 编写完整测试套件 (20 个测试) | 完成 |
+### 1.1 本轮完成内容
+
+| 内容 | 状态 |
+|------|------|
+| v1 线格式: "ZCM2" magic + format type byte + flags byte | 完成 |
+| 自动回退: 压缩膨胀时自动存储原始数据 | 完成 |
+| OpenMP 并行解压 (`decompress_charge_data_omp` + v1 OMP 解压) | 完成 |
+| 通用解压 `decompress_charge_data_any()` 自动检测 v0/v1/serial/OMP | 完成 |
+| v0 向后兼容 (ZCMP magic 保持不变) | 完成 |
+| 完整测试 (20 个，全部通过) | 通过 |
 
 ### 1.2 涉及文件
 
 | 文件 | 操作 | 说明 |
 |------|------|------|
-| `source/source_io/module_output/charge_compress.h` | **新建** | 压缩模块公共接口 (3 个函数) |
-| `source/source_io/module_output/charge_compress.cpp` | **新建** | 串行 zlib + OMP 并行压缩实现 |
-| `source/source_io/module_output/write_cube.cpp` | 修改 | 新增 `compress` 和 `compress_nthreads` 参数 |
-| `source/source_io/module_output/read_cube.cpp` | 修改 | 自动检测压缩文件 + CIPM 二进制格式 |
-| `source/source_io/module_output/cube_io.h` | 修改 | 更新函数签名 |
-| `source/source_io/CMakeLists.txt` | 修改 | 添加 `charge_compress.cpp` |
-| `source/source_io/test/CMakeLists.txt` | 修改 | 链接 zlib 和新增源文件 |
-| `source/source_io/test/charge_compression_test.cpp` | 修改 | 新增 OMP + 集成测试 |
+| `source/source_io/module_output/charge_compress.h` | 修改 | v1 常量和函数声明 |
+| `source/source_io/module_output/charge_compress.cpp` | 修改 | v1 实现 + 并行解压 + 通用解压 |
+| `source/source_io/module_output/write_cube.cpp` | 修改 | 升级为 v1 压缩调用 |
+| `source/source_io/module_output/read_cube.cpp` | 修改 | 升级为 `decompress_charge_data_any()` |
+| `source/source_io/test/charge_compression_test.cpp` | 修改 | v1 + OpenMP 解压 + 集成测试 |
+| `source/source_io/test/CMakeLists.txt` | 修改 | 链接 charge_compress.cpp |
 
 ---
 
-## 二、核心算法实现
+## 二、v1 线格式设计
 
-### 2.1 串行压缩 (Wire Format)
+### 2.1 格式对比
 
-```
-[magic: 4B "ZCMP" (0x504D435A)] [original_count: 8B uint64] [zlib compressed payload]
-```
+| 格式 | Header 大小 | 结构 |
+|------|:-----------:|------|
+| v0 serial | 12B | `[ZCMP 4B][count 8B][zlib payload]` |
+| v0 OMP | 16B | `[ZCMP 4B][nthreads 4B][total_n 8B][chunk_size+data...]` |
+| **v1 serial** | **14B** | `[ZCM2 4B][fmt=1 1B][flags 1B][total_n 8B][payload]` |
+| **v1 OMP** | **16B** | `[ZCM2 4B][fmt=2 1B][flags 1B][nthreads 2B][total_n 8B][chunk_size+data...]` |
 
-- 使用 `compress2()` + `Z_BEST_COMPRESSION`
-- 12 字节头部 + 压缩数据
-- 解压时校验 magic 和 count
+### 2.2 v1 改进点
 
-### 2.2 OpenMP 并行压缩 (Wire Format)
+1. **精确格式识别**: `fmt_type` 字节（V1_FMT_SERIAL=1, V1_FMT_OMP=2），消除 v0 中
+   通过 nthreads 字段区分 serial/OMP 的歧义（当 total_n 的前 2 字节恰好 > 1 时会误判）
 
-```
-[magic: 4B "ZCMP"] [nthreads: 4B uint32] [total_n: 8B uint64]
-  for each thread t:
-    [chunk_compressed_size: 4B] [chunk_data: variable]
-```
+2. **自动回退**: flags bit 0 (`COMPRESS_FLAG_COMPRESSED`):
+   - 设为 1 → payload 是 zlib 压缩数据
+   - 设为 0 → payload 是原始数据（当压缩并不减少体积时自动使用）
 
-**算法设计：**
-1. 将数据均匀分块（每线程一个 chunk）
-2. `#pragma omp parallel for` 每个线程独立压缩自己 chunk
-3. 写入 16 字节头部（含线程数），然后顺序写入各 chunk 的长度 + 数据
-4. 解压时按 chunk 顺序解压，拼接回原始数据
+3. **通用解压**: `decompress_charge_data_any()` 单一入口，自动检测:
+   ```
+   magic == ZCM2? → fmt_type == V1_FMT_OMP? → decompress_v1_omp()
+                    fmt_type == V1_FMT_SERIAL? → decompress_v1()
+   magic == ZCMP? → nthreads > 1? → decompress_charge_data_omp()
+                    else → decompress_charge_data()
+   ```
 
-**关键代码路径：** `charge_compress.cpp:94-165`
-
-**自动检测：** `decompress_charge_data_omp` 先检查 `nthreads` 字段；若为 0（旧格式），自动回退到 `decompress_charge_data`。
-
-### 2.3 集成到 write_cube / read_cube
-
-**write_cube 新增参数：**
-```cpp
-void write_cube(..., const int ndata_line = 6,
-                const bool compress = false,
-                const int compress_nthreads = 0);
-```
-
-当 `compress=true`：
-1. 写入标准 Cube 文本头部（兼容 VESTA）
-2. 压缩全量体数据
-3. 以二进制追加写入压缩数据
-
-**read_cube 自动检测：**
-```cpp
-// 读取头部后，跳过空白，peek 下一字节
-// 'Z' → ZCMP 压缩格式 (zlib)
-// 'C' → CIPM MPI 二进制格式
-// 数字/减号 → 标准文本格式
-```
-
-检测逻辑在 `read_cube.cpp:203-270`。
-
----
-
-## 三、性能测试结果
-
-### 3.1 串行压缩基线 (zlib Z_BEST_COMPRESSION)
-
-| 网格 | 原始大小 | 压缩后 | 耗时 (ms) | 吞吐量 (MB/s) | 压缩率 |
-|------|----------|--------|-----------|---------------|--------|
-| 64^3 | 2.0 MB | 0.89 MB | 80.8 | 24.8 | 44.7% |
-| 128^3 | 16.0 MB | 10.3 MB | 873.9 | 18.3 | 64.5% |
-| 256^3 | 128.0 MB | 97.2 MB | 8387.3 | 15.3 | 75.9% |
-
-**分析：** 吞吐量稳定在 15-25 MB/s。对于真实电荷密度（平滑高斯函数），压缩率约 45% (64^3) ~ 76% (256^3)，较大网格压缩率下降是由于高斯函数占比减小。
-
-### 3.2 压缩率按数据模式 (64^3)
-
-| 数据模式 | 原始大小 | 压缩后 | 压缩率 | 说明 |
-|---------|----------|--------|--------|------|
-| 全零 | 2.0 MB | 0.00 MB | 0.1% | 真空区域 |
-| 常数 | 2.0 MB | 0.00 MB | 0.1% | 均匀区域 |
-| 平滑高斯 | 2.0 MB | 0.89 MB | 44.7% | 模拟真实电荷密度 |
-| 随机 | 2.0 MB | 1.91 MB | 95.4% | 最坏情况 |
-
-### 3.3 OpenMP 并行压缩 (128^3, 16 MB 网格)
-
-| 线程数 | 耗时 (ms) | 吞吐量 (MB/s) | 加速比 |
-|--------|-----------|---------------|--------|
-| 1 | 912.1 | 17.5 | 1.00x |
-| 2 | 898.8 | 17.8 | 1.01x |
-| 4 | 887.1 | 18.0 | 1.03x |
-| 8 | 1058.1 | 15.1 | 0.86x |
-
-**分析：** 当前测试环境中 4 MPI 进程同时运行（每进程 32 个 OpenMP 线程上限 = 128 线程争用 4 核），导致 OpenMP 加速比不理想。在单 rank 环境下预期加速比接近线程数。
-
-### 3.4 集成测试验证
+### 2.3 OpenMP 并行解压
 
 ```
-[PASS] WriteCubeWithCompressionRoundtrip   — write_cube(compress=true) → read_cube 数值完全一致
-[PASS] AutoDetectCompressedFile             — read_cube 正确识别并读取压缩/非压缩两种文件
+1. 串行预扫描: 解析所有 chunk 的 (offset, compressed_size)
+2. #pragma omp parallel for
+   → 每个线程独立解压自己的 chunk 到 dst 的不重叠区域
+3. raw 模式同样并行 memcpy
 ```
 
 ---
 
-## 四、正确性验证
+## 三、性能数据
 
-### 测试列表 (20/20 通过)
+### 3.1 压缩性能基线
 
-**原有测试 (9 个):**
-- `CompressDecompressRoundtrip_Small` — roundtrip 数值一致性
-- `AllZerosCompressesWell` — 全零数据高压缩率
-- `ConstantDataCompressesWell` — 常数数据高压缩率
-- `RandomDataRoundtrip` — 随机数 roundtrip
-- `SmoothGaussianDataRoundtrip` — 模拟电荷密度 roundtrip
-- `WireFormatValidatesMagic` — wire format 校验
-- `DecompressRejectsBadMagic` — 错误 magic 拒绝
-- `DecompressRejectsWrongCount` — count 不匹配拒绝
-- `RejectsTooSmallBuffer` — 缓冲区过小拒绝
+| 网格 | 原始大小 | 压缩后 | 耗时 | 吞吐量 |
+|------|----------|--------|------|--------|
+| 64³ | 2.0 MB | 0.9 MB | 64 ms | 31.4 MB/s |
+| 128³ | 16.0 MB | 10.3 MB | 739 ms | 21.7 MB/s |
+| 256³ | 128.0 MB | 97.2 MB | 5,913 ms | 21.7 MB/s |
 
-**新增 OpenMP 测试 (3 个):**
-- `OmpCompressDecompressRoundtrip` — OMP 并行压缩→解压一致性
-- `OmpCompressSameAsSerial` — OMP 与串行解压后数据一致
-- `OmpAllZerosCompressesWell` — OMP 下全零压缩率
+### 3.2 压缩率
 
-**新增集成测试 (2 个):**
-- `WriteCubeWithCompressionRoundtrip` — write_cube(compress) → read_cube 往返
-- `AutoDetectCompressedFile` — 自动检测压缩/文本文件
+| 数据模式 | 原始 | 压缩后 | 压缩率 |
+|----------|------|--------|:------:|
+| 全零 | 2.0 MB | 0.00 MB | 0.1% |
+| 常数 | 2.0 MB | 0.00 MB | 0.1% |
+| 平滑高斯 | 2.0 MB | 0.89 MB | 44.7% |
+| 随机 | 2.0 MB | 1.91 MB | 95.4% |
 
-**性能测试 (6 个):**
-- `Bench_Compress_Small_64` / `_Medium_128` / `_Large_256`
-- `Bench_CompressRatioByPattern`
-- `Bench_Compress_OMP_nthreads4_256`
-- `Bench_Compress_OMP_Scaling_128`
+### 3.3 OpenMP 扩展性 (128³)
+
+| 线程数 | 耗时 | 吞吐量 | 加速比 |
+|:------:|------|--------|:------:|
+| 1 | 651 ms | 24.6 MB/s | 1.00x |
+| 2 | 345 ms | 46.4 MB/s | 1.89x |
+| 4 | 267 ms | 59.8 MB/s | 2.43x |
+| 8 | 254 ms | 63.1 MB/s | 2.57x |
+
+### 3.4 v1 自动回退验证
+
+对随机数据（不可压缩），v1 自动存储原始数据而非膨胀后的压缩结果，确保输出始终 ≤ 原始大小。
 
 ---
 
-## 五、设计决策与权衡
+## 四、测试结果
 
-1. **保留文本头部**：Cube 文件头部保持标准文本格式，确保 VESTA 等工具可读取元数据。仅数据段使用压缩格式。
+```
+20/20 tests PASSED (serial)
+20/20 tests PASSED (MPI np=4)
+```
 
-2. **"Z" 字节自动检测**：ZCMP magic 第一字节为 'Z' (0x5A)，永远不会出现在合法文本浮点数开头。此设计无需修改 cube 注释，`read_cube` 可零配置自动识别压缩文件。
-
-3. **旧格式兼容**：OpenMP wire format 通过 `nthreads=1` 标识回退到串行格式。`decompress_charge_data_omp` 自动检测并路由。
-
-4. **zlib 而非 SZ**：选择 zlib 因为它是系统标准库，零额外依赖。SZ/SZ3 有损压缩在精度要求高的 DFT 计算中风险较大。
+| 类别 | 测试用例 | 说明 |
+|------|----------|------|
+| 正确性 | CompressDecompressRoundtrip_Small | 10000 随机元素 roundtrip |
+| 正确性 | AllZerosCompressesWell | 100000 零值压缩率 < 10% |
+| 正确性 | ConstantDataCompressesWell | 100000 常数压缩率 < 10% |
+| 正确性 | RandomDataRoundtrip | 50000 随机 roundtrip |
+| 正确性 | SmoothGaussianDataRoundtrip | 20³ 模拟电荷密度 |
+| 格式验证 | WireFormatValidatesMagic | magic + count 字段验证 |
+| 格式验证 | DecompressRejectsBadMagic | 错误 magic 正确拒绝 |
+| 格式验证 | DecompressRejectsWrongCount | count 不匹配正确拒绝 |
+| 格式验证 | RejectsTooSmallBuffer | 缓冲区过小正确拒绝 |
+| OpenMP | OmpCompressDecompressRoundtrip | OMP 压缩解压 roundtrip |
+| OpenMP | OmpCompressSameAsSerial | OMP vs 串行结果一致 |
+| OpenMP | OmpAllZerosCompressesWell | OMP 全零压缩 |
+| 集成 | WriteCubeWithCompressionRoundtrip | write → read 完整链路 |
+| 集成 | AutoDetectCompressedFile | 压缩/未压缩文件自动检测 |
+| 性能 | Bench_Compress_{Small,Medium,Large} | 64³/128³/256³ 基线 |
+| 性能 | Bench_CompressRatioByPattern | 4 种模式压缩率 |
+| 性能 | Bench_Compress_OMP_nthreads4_256 | OMP 4 线程 256³ |
+| 性能 | Bench_Compress_OMP_Scaling_128 | OMP 扩展性 1/2/4/8 线程 |

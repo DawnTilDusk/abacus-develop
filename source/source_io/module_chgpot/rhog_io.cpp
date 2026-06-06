@@ -472,18 +472,27 @@ bool ModuleIO::read_rhog_mpi(const std::string& filename,
     if (nspin_in < PARAM.inp.nspin)
         ModuleBase::WARNING("ModuleIO::read_rhog", "some spin channels in file are missing");
 
-    // Read header part 2: /9/ b1..b3 /9/
-    std::vector<char> hdr2(80);
-    MPI_File_read_all(fh, hdr2.data(), 80, MPI_BYTE, MPI_STATUS_IGNORE);
+    // Read header part 2: lattice vectors  /9/ b1(3d) b2(3d) b3(3d) /9/
+    // Layout: 2 int markers + 9 doubles = 2*4 + 9*8 = 80 bytes
+    constexpr MPI_Offset HDR_PART1_SIZE = 5 * sizeof(int);          // 20 bytes
+    constexpr MPI_Offset HDR_PART2_SIZE = 2 * sizeof(int) + 9 * sizeof(double); // 80 bytes
+    constexpr MPI_Offset HEADER_SIZE = HDR_PART1_SIZE + HDR_PART2_SIZE; // 100 bytes
+
+    std::vector<char> hdr2(HDR_PART2_SIZE);
+    MPI_File_read_all(fh, hdr2.data(), HDR_PART2_SIZE, MPI_BYTE, MPI_STATUS_IGNORE);
 
     double b1[3], b2[3], b3[3];
-    std::memcpy(b1, hdr2.data() + 4, 24);  // skip size=9 marker
-    std::memcpy(b2, hdr2.data() + 28, 24);
-    std::memcpy(b3, hdr2.data() + 52, 24);
+    std::memcpy(b1, hdr2.data() + sizeof(int), 3 * sizeof(double));  // skip size=9 marker
+    std::memcpy(b2, hdr2.data() + sizeof(int) + 3 * sizeof(double), 3 * sizeof(double));
+    std::memcpy(b3, hdr2.data() + sizeof(int) + 6 * sizeof(double), 3 * sizeof(double));
 
     // Read Miller indices: /3*ngm_g/ miller[...] /3*ngm_g/
-    MPI_Offset miller_section_offset = 100; // 20 + 80 bytes
-    MPI_Offset miller_data_offset = miller_section_offset + 4; // skip size marker
+    // Layout: int marker + 3*npwtot_in ints + int marker
+    constexpr MPI_Offset MILLER_MARKER_SIZE = sizeof(int);
+    const MPI_Offset miller_section_offset = HEADER_SIZE;
+    const MPI_Offset miller_data_offset = miller_section_offset + MILLER_MARKER_SIZE;
+    const MPI_Offset miller_section_bytes = 2 * MILLER_MARKER_SIZE
+                                            + static_cast<MPI_Offset>(3 * npwtot_in) * sizeof(int);
     int miller_count = 3 * npwtot_in;
     std::vector<int> miller(miller_count);
 
@@ -506,16 +515,19 @@ bool ModuleIO::read_rhog_mpi(const std::string& filename,
         fftixyz2ig[ixyz] = ig;
     }
 
-    // Read rhog data for each spin
-    MPI_Offset rhog_section_offset = miller_section_offset + 8 + 12 * npwtot_in;
-    // miller section: 4B size + 12*npwtot_in B data + 4B size = 8 + 12*npwtot_in
+    // Read rhog data for each spin channel
+    // Each spin section: int marker + npwtot_in complex doubles + int marker
+    constexpr MPI_Offset RHOG_MARKER_SIZE = sizeof(int);
+    const MPI_Offset rhog_spin_bytes = 2 * RHOG_MARKER_SIZE
+                                       + static_cast<MPI_Offset>(npwtot_in) * sizeof(std::complex<double>);
+    MPI_Offset rhog_section_offset = miller_section_offset + miller_section_bytes;
 
     std::vector<std::complex<double>> rhog_in(npwtot_in);
 
     for (int is = 0; is < nspin_in; ++is)
     {
         // Skip size marker, read data
-        MPI_Offset data_off = rhog_section_offset + 4;
+        MPI_Offset data_off = rhog_section_offset + RHOG_MARKER_SIZE;
         MPI_File_read_at_all(fh, data_off, rhog_in.data(), npwtot_in,
                              MPI_DOUBLE_COMPLEX, MPI_STATUS_IGNORE);
 
@@ -544,7 +556,7 @@ bool ModuleIO::read_rhog_mpi(const std::string& filename,
             }
         }
 
-        rhog_section_offset += 8 + 16 * npwtot_in;
+        rhog_section_offset += rhog_spin_bytes;
 
         // nspin=2 -> 4 conversion
         if (nspin_in == 2 && PARAM.inp.nspin == 4 && is == 1)

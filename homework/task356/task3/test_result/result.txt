@@ -1,24 +1,37 @@
 ======================================================================
-Task 3: Cube 文件写入优化 — 测试结果
+Task 3: Cube 文件写入优化 — 测试结果（第二轮）
 ======================================================================
-Date: 2026-05-22
+Date: 2026-06-06
 Test: MODULE_IO_write_cube_test
-MPI processes: 4 (each rank uses unique tmp file)
+MPI processes: 1 (serial) + 4 (parallel)
 ======================================================================
 
-Correctness Tests (all ranks pass individually):
+Correctness Tests:
   [PASS] WriteTextCubeAndReadBack       — write -> read_cube roundtrip, data match 1e-6
   [PASS] ReadbackHeaderCorrect          — comment/natom/origin/nx/ny/nz/dx/dy/dz correct
-  [PASS] DataLayoutZFastest             — z-fastest ordering verified (ix*100+iy*10+iz)
+  [PASS] DataLayoutZFastest             — z-fastest ordering verified
   [PASS] ReadCubeFileNotFound           — nonexistent file returns false
 
-Serial Performance Baseline (single-rank, text format):
+MPI-IO Correctness Tests:
+  [PASS] MPIWriteBinaryCubeAndReadBack  — MPI-IO write -> read_cube roundtrip, data match 1e-10
+  [PASS] TextVsBinaryConsistency        — text vs MPI binary produce identical data
+
+Serial Performance Baseline (text format):
 ----------------------------------------------------------------------
   Grid    |  Data Size  |  Time (ms)  |  Throughput (MB/s)
 ----------------------------------------------------------------------
-  64^3    |    2.0 MB   |    330.20   |    6.21
-  128^3   |   16.2 MB   |   3700.28   |    4.38
-  256^3   |  128.8 MB   |  24475.97   |    5.26
+  64^3    |    2.0 MB   |    141.21   |   14.52
+  128^3   |   16.2 MB   |   1219.95   |   13.28
+  256^3   |  128.8 MB   |   7314.99   |   17.61
 ----------------------------------------------------------------------
 
-Summary: 7/7 tests PASSED (all ranks)
+MPI-IO Binary Performance (single rank):
+----------------------------------------------------------------------
+  Grid    |  Data Size  |  Time (ms)  |  Throughput (MB/s)
+----------------------------------------------------------------------
+  256^3   |  128.8 MB   |    394.29   |   326.66
+----------------------------------------------------------------------
+
+Speedup vs text: 7315 / 394 = 18.6x
+
+Summary: 10/10 tests PASSED (serial), 10/10 PASSED (MPI np=4, all ranks)

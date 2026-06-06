@@ -245,20 +245,21 @@ void ModuleIO::write_cube(const std::string& file,
 
     if (compress)
     {
-        // Write compressed binary data section
+        // Write header as text, then append compressed binary data section.
+        // Close the text stream first so we can reopen in binary append mode.
         ofs.close();
 
-        // Compress the data
+        // Compress the data using v1 format (auto-fallback to raw if not beneficial)
         size_t nxyz = static_cast<size_t>(nx) * ny * nz;
         std::vector<uint8_t> cbuf;
         bool ok = false;
         if (compress_nthreads > 1)
         {
-            ok = compress_charge_data_omp(data.data(), nxyz, cbuf, compress_nthreads);
+            ok = compress_charge_data_omp_v1(data.data(), nxyz, cbuf, compress_nthreads);
         }
         else
         {
-            ok = compress_charge_data(data.data(), nxyz, cbuf);
+            ok = compress_charge_data_v1(data.data(), nxyz, cbuf);
         }
 
         if (!ok)

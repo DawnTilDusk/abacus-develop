@@ -163,13 +163,16 @@ TEST_F(ReadRhogMPITest, MissingFileWarningWritten)
 
     EXPECT_FALSE(result);
 
-    std::ifstream ifs(warn_file);
-    std::stringstream ss;
-    ss << ifs.rdbuf();
-    ifs.close();
-    std::string content = ss.str();
-
-    EXPECT_NE(content.find("Can't open file"), std::string::npos);
+    // read_rhog only writes the warning on RANK_IN_POOL == 0
+    if (GlobalV::RANK_IN_POOL == 0)
+    {
+        std::ifstream ifs(warn_file);
+        std::stringstream ss;
+        ss << ifs.rdbuf();
+        ifs.close();
+        std::string content = ss.str();
+        EXPECT_NE(content.find("Can't open file"), std::string::npos);
+    }
     std::remove(warn_file.c_str());
 }
 

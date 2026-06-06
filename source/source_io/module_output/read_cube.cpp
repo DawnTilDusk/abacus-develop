@@ -202,13 +202,13 @@ bool ModuleIO::read_cube(const std::string& file,
 
     // Record position after header to detect compression / binary format.
     // Text data starts with digit/minus/dot.
-    // Compressed data starts with 'Z' (first byte of "ZCMP" magic in LE).
+    // Compressed data starts with 'Z' (first byte of "ZCMP"/"ZCM2" magic in LE).
     // MPI binary data starts with 'C' (first byte of "CIPM" marker in LE).
     ifs >> std::ws;
     std::streampos data_start = ifs.tellg();
     int next_char = ifs.peek();
 
-    // Attempt compressed read (ZCMP magic)
+    // Attempt compressed read ('Z' = ZCMP v0 or ZCM2 v1 magic)
     if (next_char == 'Z' || next_char == 'C')
     {
         ifs.close();
@@ -228,13 +228,11 @@ bool ModuleIO::read_cube(const std::string& file,
             uint32_t magic = 0;
             std::memcpy(&magic, raw_buf.data(), 4);
 
-            // Check for zlib-compressed data (ZCMP magic)
-            if (magic == CHARGE_COMPRESS_MAGIC)
+            // Check for zlib-compressed data (ZCMP v0 or ZCM2 v1 magic)
+            if (magic == CHARGE_COMPRESS_MAGIC || magic == CHARGE_COMPRESS_MAGIC_V1)
             {
-                bool ok = decompress_charge_data(raw_buf.data(), raw_len, data.data(), nxyz);
-                if (!ok)
-                    ok = decompress_charge_data_omp(raw_buf.data(), raw_len, data.data(), nxyz);
-                if (ok)
+                // Universal decompress auto-detects v0/v1 format
+                if (decompress_charge_data_any(raw_buf.data(), raw_len, data.data(), nxyz))
                     return true;
             }
 
