@@ -421,3 +421,156 @@ bool ModuleIO::write_rhog(const std::string& fchg,
 // print(np.max(np.abs(diff)))
 // test system: integrated test 118_PW_CHG_BINARY
 // yielding error 5.290000000000175e-11
+
+#ifdef __MPI
+
+bool ModuleIO::read_rhog_mpi(const std::string& filename,
+                              const ModulePW::PW_Basis* pw_rhod,
+                              std::complex<double>** rhog,
+                              MPI_Comm comm)
+{
+    ModuleBase::TITLE("ModuleIO", "read_rhog_mpi");
+    ModuleBase::timer::start("ModuleIO", "read_rhog_mpi");
+
+    const int nx = pw_rhod->nx;
+    const int ny = pw_rhod->ny;
+    const int nz = pw_rhod->nz;
+
+    MPI_File fh;
+    int ret = MPI_File_open(comm, filename.c_str(), MPI_MODE_RDONLY,
+                            MPI_INFO_NULL, &fh);
+    if (ret != MPI_SUCCESS)
+    {
+        ModuleBase::WARNING("ModuleIO::read_rhog", "Can't open file " + filename);
+        ModuleBase::timer::end("ModuleIO", "read_rhog_mpi");
+        return false;
+    }
+
+    // Read header part 1: /3/ gamma_only npwtot nspin /3/
+    std::vector<char> hdr1(20);
+    MPI_File_read_all(fh, hdr1.data(), 20, MPI_BYTE, MPI_STATUS_IGNORE);
+
+    int size1 = 0, gamma_only_in = 0, npwtot_in = 0, nspin_in = 0, size2 = 0;
+    std::memcpy(&size1, hdr1.data(), 4);
+    std::memcpy(&gamma_only_in, hdr1.data() + 4, 4);
+    std::memcpy(&npwtot_in, hdr1.data() + 8, 4);
+    std::memcpy(&nspin_in, hdr1.data() + 12, 4);
+    std::memcpy(&size2, hdr1.data() + 16, 4);
+
+    if (gamma_only_in != pw_rhod->gamma_only)
+    {
+        MPI_File_close(&fh);
+        ModuleBase::WARNING("ModuleIO::read_rhog",
+                            "gamma_only read from file is inconsistent with INPUT");
+        ModuleBase::timer::end("ModuleIO", "read_rhog_mpi");
+        return false;
+    }
+    if (npwtot_in > pw_rhod->npwtot)
+        ModuleBase::WARNING("ModuleIO::read_rhog", "some planewaves in file are not used");
+    else if (npwtot_in < pw_rhod->npwtot)
+        ModuleBase::WARNING("ModuleIO::read_rhog", "some planewaves in file are missing");
+    if (nspin_in < PARAM.inp.nspin)
+        ModuleBase::WARNING("ModuleIO::read_rhog", "some spin channels in file are missing");
+
+    // Read header part 2: lattice vectors  /9/ b1(3d) b2(3d) b3(3d) /9/
+    // Layout: 2 int markers + 9 doubles = 2*4 + 9*8 = 80 bytes
+    constexpr MPI_Offset HDR_PART1_SIZE = 5 * sizeof(int);          // 20 bytes
+    constexpr MPI_Offset HDR_PART2_SIZE = 2 * sizeof(int) + 9 * sizeof(double); // 80 bytes
+    constexpr MPI_Offset HEADER_SIZE = HDR_PART1_SIZE + HDR_PART2_SIZE; // 100 bytes
+
+    std::vector<char> hdr2(HDR_PART2_SIZE);
+    MPI_File_read_all(fh, hdr2.data(), HDR_PART2_SIZE, MPI_BYTE, MPI_STATUS_IGNORE);
+
+    double b1[3], b2[3], b3[3];
+    std::memcpy(b1, hdr2.data() + sizeof(int), 3 * sizeof(double));  // skip size=9 marker
+    std::memcpy(b2, hdr2.data() + sizeof(int) + 3 * sizeof(double), 3 * sizeof(double));
+    std::memcpy(b3, hdr2.data() + sizeof(int) + 6 * sizeof(double), 3 * sizeof(double));
+
+    // Read Miller indices: /3*ngm_g/ miller[...] /3*ngm_g/
+    // Layout: int marker + 3*npwtot_in ints + int marker
+    constexpr MPI_Offset MILLER_MARKER_SIZE = sizeof(int);
+    const MPI_Offset miller_section_offset = HEADER_SIZE;
+    const MPI_Offset miller_data_offset = miller_section_offset + MILLER_MARKER_SIZE;
+    const MPI_Offset miller_section_bytes = 2 * MILLER_MARKER_SIZE
+                                            + static_cast<MPI_Offset>(3 * npwtot_in) * sizeof(int);
+    int miller_count = 3 * npwtot_in;
+    std::vector<int> miller(miller_count);
+
+    MPI_File_read_at_all(fh, miller_data_offset, miller.data(), miller_count,
+                         MPI_INT, MPI_STATUS_IGNORE);
+
+    // Zero out rhog
+    for (int is = 0; is < PARAM.inp.nspin; ++is)
+        ModuleBase::GlobalFunc::ZEROS(rhog[is], pw_rhod->npw);
+
+    // Build fftixyz2ig map
+    std::vector<int> fftixyz2ig(pw_rhod->nxyz, -1);
+    for (int ig = 0; ig < pw_rhod->npw; ++ig)
+    {
+        int isz = pw_rhod->ig2isz[ig];
+        int iz = isz % nz;
+        int is = isz / nz;
+        int ixy = pw_rhod->is2fftixy[is];
+        int ixyz = iz + nz * ixy;
+        fftixyz2ig[ixyz] = ig;
+    }
+
+    // Read rhog data for each spin channel
+    // Each spin section: int marker + npwtot_in complex doubles + int marker
+    constexpr MPI_Offset RHOG_MARKER_SIZE = sizeof(int);
+    const MPI_Offset rhog_spin_bytes = 2 * RHOG_MARKER_SIZE
+                                       + static_cast<MPI_Offset>(npwtot_in) * sizeof(std::complex<double>);
+    MPI_Offset rhog_section_offset = miller_section_offset + miller_section_bytes;
+
+    std::vector<std::complex<double>> rhog_in(npwtot_in);
+
+    for (int is = 0; is < nspin_in; ++is)
+    {
+        // Skip size marker, read data
+        MPI_Offset data_off = rhog_section_offset + RHOG_MARKER_SIZE;
+        MPI_File_read_at_all(fh, data_off, rhog_in.data(), npwtot_in,
+                             MPI_DOUBLE_COMPLEX, MPI_STATUS_IGNORE);
+
+        // Map to local G-vectors (same logic as original read_rhog)
+        for (int i = 0; i < npwtot_in; ++i)
+        {
+            int ix = miller[i * 3];
+            int iy = miller[i * 3 + 1];
+            int iz = miller[i * 3 + 2];
+
+            if (ix <= -int((nx + 1) / 2) || ix >= int(nx / 2) + 1
+                || iy <= -int((ny + 1) / 2) || iy >= int(ny / 2) + 1
+                || iz <= -int((nz + 1) / 2) || iz >= int(nz / 2) + 1)
+                continue;
+
+            if (ix < 0) ix += nx;
+            if (iy < 0) iy += ny;
+            if (iz < 0) iz += nz;
+
+            int fftixy = iy + pw_rhod->fftny * ix;
+            if (GlobalV::RANK_IN_POOL == pw_rhod->fftixy2ip[fftixy])
+            {
+                int fftixyz = iz + nz * fftixy;
+                int ig = fftixyz2ig[fftixyz];
+                rhog[is][ig] = rhog_in[i];
+            }
+        }
+
+        rhog_section_offset += rhog_spin_bytes;
+
+        // nspin=2 -> 4 conversion
+        if (nspin_in == 2 && PARAM.inp.nspin == 4 && is == 1)
+        {
+            for (int ig = 0; ig < pw_rhod->npw; ++ig)
+                rhog[3][ig] = rhog[1][ig];
+            ModuleBase::GlobalFunc::ZEROS(rhog[1], pw_rhod->npw);
+            ModuleBase::GlobalFunc::ZEROS(rhog[2], pw_rhod->npw);
+        }
+    }
+
+    MPI_File_close(&fh);
+    ModuleBase::timer::end("ModuleIO", "read_rhog_mpi");
+    return true;
+}
+
+#endif

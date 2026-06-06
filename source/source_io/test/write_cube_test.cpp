@@ -303,12 +303,141 @@ TEST_F(WriteCubeTest, Bench_WriteCube_SerialText_256)
     std::remove(fn.c_str());
 }
 
-// === Reserved slots for MPI-IO / binary format tests (post-optimization) ===
-// TEST_F(WriteCubeTest, MPIWriteAllRanksConsistent) { ... }
-// TEST_F(WriteCubeTest, TextVsBinaryConsistency) { ... }
-// TEST_F(WriteCubeTest, Bench_WriteCube_MPIIO_np4_256) { ... }
-// TEST_F(WriteCubeTest, Bench_WriteCube_MPIIO_np8_256) { ... }
-// TEST_F(WriteCubeTest, Bench_WriteCube_BinaryFormat_256) { ... }
+// ===================================================================
+// MPI-IO parallel write tests
+// ===================================================================
+
+#ifdef __MPI
+
+TEST_F(WriteCubeTest, MPIWriteBinaryCubeAndReadBack)
+{
+    // All ranks do MPI-IO write, then rank 0 reads back and verifies
+    auto m = make_cube_meta(16, 16, 16);
+    std::string fn = "test_mpi_binary.cube";
+
+    ModuleIO::write_cube_mpi(fn, m.comment, m.natom, m.origin,
+                             m.nx, m.ny, m.nz,
+                             m.dx, m.dy, m.dz,
+                             m.atom_type, m.atom_charge, m.atom_pos,
+                             m.data, 6, MPI_COMM_WORLD);
+
+    // Rank 0 reads back
+    if (GlobalV::MY_RANK == 0)
+    {
+        std::vector<std::string> cmt;
+        int nr = 0;
+        std::vector<double> org(3);
+        int nx_r = 0, ny_r = 0, nz_r = 0;
+        std::vector<double> dxr(3), dyr(3), dzr(3);
+        std::vector<int> at;
+        std::vector<double> ac;
+        std::vector<std::vector<double>> ap;
+        std::vector<double> rdata;
+
+        bool ok = ModuleIO::read_cube(fn, cmt, nr, org, nx_r, ny_r, nz_r,
+                                      dxr, dyr, dzr, at, ac, ap, rdata);
+        ASSERT_TRUE(ok);
+        EXPECT_EQ(m.natom, nr);
+        EXPECT_EQ(m.nx, nx_r);
+        EXPECT_EQ(m.ny, ny_r);
+        EXPECT_EQ(m.nz, nz_r);
+        ASSERT_EQ(m.data.size(), rdata.size());
+
+        for (size_t i = 0; i < m.data.size(); ++i)
+            EXPECT_NEAR(m.data[i], rdata[i], 1e-10) << "mismatch at " << i;
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (GlobalV::MY_RANK == 0)
+        std::remove(fn.c_str());
+}
+
+TEST_F(WriteCubeTest, TextVsBinaryConsistency)
+{
+    // Write the same data with text and MPI binary, verify both read identically
+    auto m = make_cube_meta(10, 10, 10);
+    std::string fn_txt = "test_consist_txt.cube";
+    std::string fn_bin = "test_consist_bin.cube";
+
+    // Write text (rank 0 only)
+    if (GlobalV::MY_RANK == 0)
+    {
+        ModuleIO::write_cube(fn_txt, m.comment, m.natom, m.origin,
+                             m.nx, m.ny, m.nz, m.dx, m.dy, m.dz,
+                             m.atom_type, m.atom_charge, m.atom_pos,
+                             m.data, 6);
+    }
+
+    // Write binary (all ranks via MPI-IO)
+    ModuleIO::write_cube_mpi(fn_bin, m.comment, m.natom, m.origin,
+                             m.nx, m.ny, m.nz, m.dx, m.dy, m.dz,
+                             m.atom_type, m.atom_charge, m.atom_pos,
+                             m.data, 6, MPI_COMM_WORLD);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Rank 0 reads both and compares
+    if (GlobalV::MY_RANK == 0)
+    {
+        auto read_one = [](const std::string& f) {
+            std::vector<std::string> cmt;
+            int nr = 0;
+            std::vector<double> org(3);
+            int nx_r = 0, ny_r = 0, nz_r = 0;
+            std::vector<double> dxr(3), dyr(3), dzr(3);
+            std::vector<int> at;
+            std::vector<double> ac;
+            std::vector<std::vector<double>> ap;
+            std::vector<double> d;
+            ModuleIO::read_cube(f, cmt, nr, org, nx_r, ny_r, nz_r,
+                                dxr, dyr, dzr, at, ac, ap, d);
+            return d;
+        };
+
+        auto d_txt = read_one(fn_txt);
+        auto d_bin = read_one(fn_bin);
+
+        ASSERT_EQ(d_txt.size(), d_bin.size());
+        // Text format uses precision=6 (6 sig digits), so 1e-7 tolerance is appropriate
+        for (size_t i = 0; i < d_txt.size(); ++i)
+            EXPECT_NEAR(d_txt[i], d_bin[i], 1e-6) << "txt vs bin mismatch at " << i;
+
+        std::remove(fn_txt.c_str());
+        std::remove(fn_bin.c_str());
+    }
+}
+
+TEST_F(WriteCubeTest, Bench_WriteCube_MPIIO_Binary_256)
+{
+    auto m = make_cube_meta(256, 256, 256);
+    std::string fn = "bench_mpi_bin_256.cube";
+    double data_mb = static_cast<double>(m.data.size() * sizeof(double)) / 1048576.0 + 0.8;
+    int repeat = 1;
+    int np = GlobalV::NPROC;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    for (int r = 0; r < repeat; ++r)
+    {
+        ModuleIO::write_cube_mpi(fn, m.comment, m.natom, m.origin,
+                                 m.nx, m.ny, m.nz,
+                                 m.dx, m.dy, m.dz,
+                                 m.atom_type, m.atom_charge, m.atom_pos,
+                                 m.data, 6, MPI_COMM_WORLD);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    long long t = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    bench_report("WriteCube_MPIIO_Binary_256", t, repeat, data_mb, np);
+
+    if (GlobalV::MY_RANK == 0)
+        std::remove(fn.c_str());
+}
+
+#endif // __MPI
 
 int main(int argc, char** argv)
 {
