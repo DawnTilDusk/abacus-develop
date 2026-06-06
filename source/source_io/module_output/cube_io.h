@@ -88,6 +88,40 @@ void write_cube_mpi(const std::string& file,
                     const MPI_Comm& comm);
 #endif
 
+// ============================================================================
+// 异步 I/O 接口 (题目4: 异步 I/O 与计算重叠)
+//
+// 提供异步版本的 write_vdata_palgrid，将文件 I/O 操作提交到独立的
+// I/O 工作线程执行，使主计算线程无需等待文件写入完成即可继续计算。
+//
+// 使用方法:
+//   1. 程序启动时调用 AsyncIOManager::instance().start()
+//   2. 在需要写入 Cube 文件的位置，调用 write_vdata_palgrid_async()
+//      替代 write_vdata_palgrid()，传入相同的参数
+//   3. 在需要确保所有文件已写入完成的位置(例如程序退出前)，
+//      调用 AsyncIOManager::instance().wait_all()
+//   4. 程序退出前调用 AsyncIOManager::instance().stop()
+//
+// 性能收益:
+//   - I/O 与计算重叠: 主线程提交任务后立即返回，继续后续计算
+//   - 减少 MPI_Barrier 等待: 移除与 I/O 相关的同步屏障
+//   - 双缓冲机制: I/O 线程写一个缓冲区时，主线程可填充另一个缓冲区
+// ============================================================================
+
+/// @brief 异步版本的 write_vdata_palgrid
+/// 将 MPI 归约后的数据提交到异步 I/O 管理器，由独立工作线程写入文件
+void write_vdata_palgrid_async(const Parallel_Grid& pgrid,
+                               const double* const data,
+                               const int is,
+                               const int nspin,
+                               const int iter,
+                               const std::string& fn,
+                               const double ef,
+                               const UnitCell* const ucell,
+                               const int precision = 11,
+                               const int out_fermi = 1,
+                               const bool reduce_all_pool = false);
+
 /**
  * @brief The trilinear interpolation method
  *

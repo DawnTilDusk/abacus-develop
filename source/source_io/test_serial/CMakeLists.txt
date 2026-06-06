@@ -46,8 +46,8 @@ AddTest(
 
 AddTest(
   TARGET MODULE_IO_rho_io
-  LIBS parameter ${math_libs} base device cell_info 
-  SOURCES rho_io_test.cpp ../module_output/read_cube.cpp ../module_output/write_cube.cpp ../module_output/output.cpp
+  LIBS parameter ${math_libs} base device cell_info z async_io
+  SOURCES rho_io_test.cpp ../module_output/read_cube.cpp ../module_output/write_cube.cpp ../module_output/output.cpp ../module_output/charge_compress.cpp
 )
 
 AddTest(

@@ -9,6 +9,7 @@
 #include "source_base/math_integral.h"
 #include "source_base/math_sphbes.h"
 #include "source_base/parallel_reduce.h"
+#include "source_base/parallel_comm.h"
 #include "source_base/timer.h"
 #include "source_base/tool_threading.h"
 #include "source_estate/magnetism.h"
@@ -17,8 +18,33 @@
 #include "source_io/module_chgpot/rhog_io.h"
 #include "source_io/module_wf/read_wf2rho_pw.h"
 #include "source_io/module_restart/restart.h"
+#include "source_io/module_async_io/async_io_manager.h"
+#include "source_io/module_async_io/io_buffer.h"
 #include "source_hamilt/module_xc/xc_functional.h"
 #include "source_cell/klist.h"
+
+// ============================================================================
+// AsyncIOScopeGuard: RAII 辅助类
+// 确保在异常退出时正确等待 I/O 任务完成, 避免资源泄漏。
+// ============================================================================
+class AsyncIOScopeGuard
+{
+  public:
+    explicit AsyncIOScopeGuard(AsyncIOManager& mgr) : mgr_(mgr) {}
+    ~AsyncIOScopeGuard()
+    {
+        // 如果管理器仍在运行且有待完成任务, 等待完成
+        if (mgr_.is_running())
+        {
+            mgr_.wait_all();
+        }
+    }
+    AsyncIOScopeGuard(const AsyncIOScopeGuard&) = delete;
+    AsyncIOScopeGuard& operator=(const AsyncIOScopeGuard&) = delete;
+
+  private:
+    AsyncIOManager& mgr_;
+};
 
 void Charge::init_rho(const UnitCell& ucell,
                       const Parallel_Grid& pgrid,
@@ -42,24 +68,235 @@ void Charge::init_rho(const UnitCell& ucell,
 
     bool read_error = false;
     bool read_kin_error = false;
+    // RAII 守卫: 确保函数退出时等待所有异步 I/O 完成
+    AsyncIOManager& async_mgr = AsyncIOManager::instance();
+    AsyncIOScopeGuard io_guard(async_mgr);
+
     if (PARAM.inp.init_chg == "file" || PARAM.inp.init_chg == "auto")
     {
         GlobalV::ofs_running << " Read electron density from file" << std::endl;
 
-        // try to read charge from binary file first, which is the same as QE
-        // liuyu 2023-12-05
+        // ==================================================================
+        // 路径 1: 异步二进制读取 (重叠 I/O 与初始化计算)
+        // ==================================================================
         std::stringstream binary;
         binary << PARAM.globalv.global_readin_dir << PARAM.inp.suffix + "-CHARGE-DENSITY.restart";
-        if (ModuleIO::read_rhog(binary.str(), rhopw, rhog))
+        const std::string binary_path = binary.str();
+
+        // ---------- 计时器: 异步读取路径 ----------
+        ModuleBase::timer::start("Charge", "init_rho_async_binary");
+
+        // 预构建 fftixyz2ig 映射 (不依赖文件数据, 可与 I/O 重叠)
+        const int nx = rhopw->nx;
+        const int ny = rhopw->ny;
+        const int nz = rhopw->nz;
+        std::vector<int> fftixyz2ig(rhopw->nxyz, -1);
+        for (int ig = 0; ig < rhopw->npw; ++ig)
         {
-            GlobalV::ofs_running << " Read electron density from file: " << binary.str() << std::endl;
+            int isz = rhopw->ig2isz[ig];
+            int iz = isz % nz;
+            int is_tmp = isz / nz;
+            int ixy = rhopw->is2fftixy[is_tmp];
+            int ixyz = iz + nz * ixy;
+            fftixyz2ig[ixyz] = ig;
+        }
+// async_mgr 已在上文通过 RAII 守卫初始化
+        // 获取异步 I/O 管理器实例 (已在 main.cpp 中启动)
+        AsyncIOManager& async_mgr = AsyncIOManager::instance();
+
+        // rank 0 (in pool) 提交异步读取任务
+        // 注意: 仅 rank 0 执行文件 I/O, 其余进程在 Phase 2 中等待广播
+        bool async_read_submitted = false;
+        if (GlobalV::RANK_IN_POOL == 0)
+        {
+            IOBuffer read_buf = IOBuffer::make_binary_read_result(binary_path, rhopw->npw);
+            async_read_submitted = async_mgr.submit_rhog_read(std::move(read_buf));
+            if (async_read_submitted)
+            {
+                GlobalV::ofs_running << " [TIMER] Async rhog read submitted: " << binary_path << std::endl;
+            }
+        }
+
+        // ---- Phase 2: 在 I/O 进行时, 主线程执行不依赖数据的初始化 (重叠) ----
+        // 为所有自旋清零 rhog 数组 (O(nspin * npw), 不涉及文件 I/O)
+        for (int is = 0; is < nspin; ++is)
+        {
+            ModuleBase::GlobalFunc::ZEROS(rhog[is], rhopw->npw);
+        }
+
+        // ---- Phase 3: 等待异步读取结果 ----
+        bool async_read_ok = false;
+        size_t async_data_bytes = 0;
+        if (async_read_submitted && GlobalV::RANK_IN_POOL == 0)
+        {
+            IOBuffer result = async_mgr.wait_next_completed();
+            if (!result.has_error() && !result.data().empty())
+            {
+                // 验证头部一致性
+                if (result.gamma_only_in() != rhopw->gamma_only)
+                {
+                    GlobalV::ofs_running << " WARNING: gamma_only mismatch in restart file (file="
+                                         << result.gamma_only_in() << ", expected="
+                                         << rhopw->gamma_only << ")" << std::endl;
+                }
+
+                // ---- Phase 4: Miller 索引映射 (依赖 I/O 结果) ----
+                const int npwtot_in = result.npwtot_in();
+                const int nspin_in = result.nspin_in();
+                const std::vector<double>& data = result.data();
+                const std::vector<int>& miller = result.miller();
+
+                async_data_bytes = data.size() * sizeof(double);
+
+                for (int is = 0; is < nspin_in && is < nspin; ++is)
+                {
+                    const double* spin_data = data.data() + static_cast<size_t>(is) * 2 * npwtot_in;
+                    for (int i = 0; i < npwtot_in; ++i)
+                    {
+                        int ix = miller[i * 3];
+                        int iy = miller[i * 3 + 1];
+                        int iz = miller[i * 3 + 2];
+
+                        if (ix <= -int((nx + 1) / 2) || ix >= int(nx / 2) + 1
+                            || iy <= -int((ny + 1) / 2) || iy >= int(ny / 2) + 1
+                            || iz <= -int((nz + 1) / 2) || iz >= int(nz / 2) + 1)
+                        {
+                            continue;
+                        }
+
+                        if (ix < 0) ix += nx;
+                        if (iy < 0) iy += ny;
+                        if (iz < 0) iz += nz;
+
+                        int fftixy = iy + rhopw->fftny * ix;
+                        if (GlobalV::RANK_IN_POOL == rhopw->fftixy2ip[fftixy])
+                        {
+                            int fftixyz = iz + nz * fftixy;
+                            int ig = fftixyz2ig[fftixyz];
+                            if (ig >= 0 && ig < rhopw->npw)
+                            {
+                                rhog[is][ig] = std::complex<double>(
+                                    spin_data[2 * i], spin_data[2 * i + 1]);
+                            }
+                        }
+                    }
+                }
+
+                // nspin=2 -> 4 转换
+                if (nspin_in == 2 && nspin == 4)
+                {
+                    for (int ig = 0; ig < rhopw->npw; ++ig)
+                    {
+                        rhog[3][ig] = rhog[1][ig];
+                    }
+                    ModuleBase::GlobalFunc::ZEROS(rhog[1], rhopw->npw);
+                    ModuleBase::GlobalFunc::ZEROS(rhog[2], rhopw->npw);
+                }
+
+                async_read_ok = true;
+                GlobalV::ofs_running << " [TIMER] Async read OK: " << binary_path
+                                     << " (" << async_data_bytes << " bytes, "
+                                     << npwtot_in << " G-vectors, "
+                                     << nspin_in << " spins)" << std::endl;
+            }
+            else
+            {
+                GlobalV::ofs_running << " [TIMER] Async read FAILED for " << binary_path
+                                     << ": " << result.error_message() << std::endl;
+            }
+        }
+
+#ifdef __MPI
+        // 广播异步读取结果标志, 确保所有进程进入同一路径
+        {
+            int async_ok_int = async_read_ok ? 1 : 0;
+            MPI_Bcast(&async_ok_int, 1, MPI_INT, 0, POOL_WORLD);
+            async_read_ok = (async_ok_int != 0);
+        }
+
+        // 将 rank 0 的 rhog 广播到 pool 内所有进程
+        if (async_read_ok)
+        {
+            for (int is = 0; is < nspin; ++is)
+            {
+                MPI_Bcast(rhog[is], rhopw->npw, MPI_DOUBLE_COMPLEX, 0, POOL_WORLD);
+            }
+            size_t bcast_bytes = static_cast<size_t>(nspin) * rhopw->npw * sizeof(std::complex<double>);
+            GlobalV::ofs_running << " [TIMER] Broadcast rhog done: " << bcast_bytes << " bytes" << std::endl;
+        }
+#endif
+
+        ModuleBase::timer::end("Charge", "init_rho_async_binary");
+
+        // ==================================================================
+        // 路径 2: 同步 read_rhog 回退
+        // ==================================================================
+        bool sync_read_ok = false;
+        if (!async_read_ok)
+        {
+            ModuleBase::timer::start("Charge", "init_rho_sync_binary");
+            if (ModuleIO::read_rhog(binary_path, rhopw, rhog))
+            {
+                sync_read_ok = true;
+                // 输出文件大小信息
+                size_t file_bytes = static_cast<size_t>(rhopw->npwtot) * nspin * sizeof(std::complex<double>);
+                GlobalV::ofs_running << " [TIMER] Sync read OK: " << binary_path
+                                     << " (npwtot=" << rhopw->npwtot
+                                     << ", nspin=" << nspin
+                                                     << ", estimated " << file_bytes << " bytes)" << std::endl;
+            }
+            ModuleBase::timer::end("Charge", "init_rho_sync_binary");
+        }
+
+        // ==================================================================
+        // 路径 3: MPI-IO (read_rhog_mpi) 回退
+        // ==================================================================
+        bool mpiio_read_ok = false;
+        if (!async_read_ok && !sync_read_ok)
+        {
+#ifdef __MPI
+            ModuleBase::timer::start("Charge", "init_rho_mpiio");
+            if (ModuleIO::read_rhog_mpi(binary_path, rhopw, rhog, POOL_WORLD))
+            {
+                mpiio_read_ok = true;
+                size_t file_bytes = static_cast<size_t>(rhopw->npwtot) * nspin * sizeof(std::complex<double>);
+                GlobalV::ofs_running << " [TIMER] MPI-IO read OK: " << binary_path
+                                     << " (" << file_bytes << " bytes)" << std::endl;
+            }
+            ModuleBase::timer::end("Charge", "init_rho_mpiio");
+#endif
+        }
+
+        // ==================================================================
+        // 路径 4: Cube 文件读取 (二进制全部失败时)
+        // ==================================================================
+        if (async_read_ok || sync_read_ok || mpiio_read_ok)
+        {
+            ModuleBase::timer::start("Charge", "init_rho_recip2real");
             for (int is = 0; is < nspin; ++is)
             {
                 rhopw->recip2real(rhog[is], rho[is]);
             }
+            ModuleBase::timer::end("Charge", "init_rho_recip2real");
+
+            GlobalV::ofs_running << " [TIMER] recip2real done for " << nspin << " spin(s)." << std::endl;
+
+            // ---- 输出 I/O 统计信息 ----
+            size_t async_submitted = async_mgr.total_submitted();
+            size_t async_completed = async_mgr.total_completed();
+            size_t async_rejected = async_mgr.total_rejected();
+            GlobalV::ofs_running << " [STATS] AsyncIOManager: submitted=" << async_submitted
+                                 << ", completed=" << async_completed
+                                 << ", rejected=" << async_rejected << std::endl;
+            GlobalV::ofs_running << " [STATS] Charge density read: npwtot=" << rhopw->npwtot
+                                 << ", npw=" << rhopw->npw
+                                 << ", nspin=" << nspin
+                                 << ", nrxx=" << rhopw->nrxx
+                                 << ", nxyz=" << rhopw->nxyz << std::endl;
         }
         else
         {
+            ModuleBase::timer::start("Charge", "init_rho_cube_read");
             for (int is = 0; is < nspin; ++is)
             {
 				std::stringstream ssc;
@@ -81,7 +318,7 @@ void Charge::init_rho(const UnitCell& ucell,
                     this->rho[is],
                     ucell.nat))
                 {
-                    GlobalV::ofs_running << " Read electron density from file: " << ssc.str() << std::endl;
+                    GlobalV::ofs_running << " [TIMER] Cube read OK: " << ssc.str() << std::endl;
                 }
                 else if (is > 0)    // nspin=2 or 4
                 {
@@ -114,6 +351,7 @@ void Charge::init_rho(const UnitCell& ucell,
                     break;
                 }
             }
+            ModuleBase::timer::end("Charge", "init_rho_cube_read");
         }
 
         if (read_error)
@@ -147,16 +385,28 @@ void Charge::init_rho(const UnitCell& ucell,
 
                 std::stringstream binary;
                 binary << PARAM.globalv.global_readin_dir << PARAM.inp.suffix + "-TAU-DENSITY.restart";
-                if (ModuleIO::read_rhog(binary.str(), rhopw, kin_g.data()))
+
+                // [TIMER] 动能力密度二进制读取
+                ModuleBase::timer::start("Charge", "init_rho_tau_binary");
+                bool tau_binary_ok = ModuleIO::read_rhog(binary.str(), rhopw, kin_g.data());
+                ModuleBase::timer::end("Charge", "init_rho_tau_binary");
+
+                if (tau_binary_ok)
                 {
-                    GlobalV::ofs_running << " Read in the kinetic energy density: " << binary.str() << std::endl;
+                    GlobalV::ofs_running << " [TIMER] Tau binary read OK: " << binary.str() << std::endl;
+                    // [TIMER] recip2real 变换
+                    ModuleBase::timer::start("Charge", "init_rho_tau_recip2real");
                     for (int is = 0; is < nspin; ++is)
                     {
                         rhopw->recip2real(kin_g[is], this->kin_r[is]);
                     }
+                    ModuleBase::timer::end("Charge", "init_rho_tau_recip2real");
+                    GlobalV::ofs_running << " [TIMER] Tau recip2real done for " << nspin << " spin(s)." << std::endl;
                 }
                 else
                 {
+                    // [TIMER] 动能力密度 Cube 文件读取
+                    ModuleBase::timer::start("Charge", "init_rho_tau_cube");
                     for (int is = 0; is < nspin; is++)
                     {
                         std::stringstream ssc;
@@ -170,7 +420,7 @@ void Charge::init_rho(const UnitCell& ucell,
                                 this->kin_r[is],
                                 ucell.nat))
                         {
-                            GlobalV::ofs_running << " Read in the kinetic energy density: " << ssc.str() << std::endl;
+                            GlobalV::ofs_running << " [TIMER] Tau cube read OK: " << ssc.str() << std::endl;
                         }
                         else
                         {
@@ -183,6 +433,7 @@ void Charge::init_rho(const UnitCell& ucell,
                             break;
                         }
                     }
+                    ModuleBase::timer::end("Charge", "init_rho_tau_cube");
                 }
             }
             else
@@ -269,6 +520,11 @@ void Charge::init_rho(const UnitCell& ucell,
 				PARAM.inp.nbands, nspin, PARAM.globalv.npol,
 				kv->get_nkstot(),kv->ik2iktot,kv->isk,GlobalV::ofs_running);
     }
+
+    // ---- 输出 I/O 计时摘要 ----
+    GlobalV::ofs_running << " [TIMER] === I/O Performance Summary ===" << std::endl;
+    GlobalV::ofs_running << " [TIMER] init_rho completed. read_error=" << read_error
+                         << ", read_kin_error=" << read_kin_error << std::endl;
 }
 
 //==========================================================

@@ -59,6 +59,20 @@ list(APPEND objects_advanced
     module_wannier/fR_overlap.cpp
 )
 
+# ============================================================================
+# Async I/O module: provides double-buffered asynchronous file I/O
+# that overlaps I/O operations with computation.
+#
+# NOTE: Must be added BEFORE io_basic is created so that
+#       module_async_io/async_io_manager.cpp gets compiled into io_basic.
+# ============================================================================
+add_subdirectory(module_async_io)
+
+# Add async_io_manager.cpp into the io_basic object list
+list(APPEND objects
+    module_async_io/async_io_manager.cpp
+)
+
 if(ENABLE_LCAO)
   list(APPEND objects
       module_dos/write_dos_lcao.cpp
@@ -128,6 +142,17 @@ target_include_directories(
     io_basic
     PUBLIC
     ${CMAKE_BINARY_DIR}/source/source_io
+)
+
+# Propagate async_io include directories to io_basic
+# (needed because write_cube.cpp includes async_io_manager.h)
+# ZLIB is required by charge_compress.cpp
+find_package(ZLIB REQUIRED)
+target_link_libraries(
+    io_basic
+    PUBLIC
+    async_io
+    ZLIB::ZLIB
 )
 
 add_library(

@@ -29,3 +29,5 @@ cal_force         1
 cal_stress        1
 
 pw_seed           1
+out_chg           1
+
