@@ -2,6 +2,11 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <tuple>
+#include <vector>
 #include "source_base/global_variable.h"
 #include "source_io/module_output/cube_io.h"
 #include "prepare_unitcell.h"
@@ -45,6 +50,113 @@ Parallel_Grid::~Parallel_Grid() {}
 /***************************************************************
  *  unit test of read_rho, write_rho and trilinear_interpolate
  ***************************************************************/
+
+namespace
+{
+struct RefAxisMap
+{
+    int low = 0;
+    int high = 0;
+    double w_low = 1.0;
+    double w_high = 0.0;
+};
+
+RefAxisMap build_ref_axis_map(const int src_size, const int dst_size, const int dst_index)
+{
+    if (src_size <= 1)
+    {
+        return {0, 0, 1.0, 0.0};
+    }
+
+    double frac = 0.5 * (static_cast<double>(src_size) / static_cast<double>(dst_size) * (1.0 + 2.0 * dst_index) - 1.0);
+    frac -= std::floor(frac / static_cast<double>(src_size)) * static_cast<double>(src_size);
+
+    const int low = static_cast<int>(std::floor(frac));
+    const double delta = frac - static_cast<double>(low);
+    return {low, (low + 1 == src_size) ? 0 : (low + 1), 1.0 - delta, delta};
+}
+
+double trilinear_reference_value(const double* const data_in,
+                                 const int nx_read,
+                                 const int ny_read,
+                                 const int nz_read,
+                                 const int nx,
+                                 const int ny,
+                                 const int nz,
+                                 const int ix,
+                                 const int iy,
+                                 const int iz)
+{
+    const RefAxisMap x_map = build_ref_axis_map(nx_read, nx, ix);
+    const RefAxisMap y_map = build_ref_axis_map(ny_read, ny, iy);
+    const RefAxisMap z_map = build_ref_axis_map(nz_read, nz, iz);
+
+    const auto index = [=](const int x, const int y, const int z) {
+        return (x * ny_read + y) * nz_read + z;
+    };
+
+    return data_in[index(x_map.low, y_map.low, z_map.low)] * x_map.w_low * y_map.w_low * z_map.w_low
+         + data_in[index(x_map.high, y_map.low, z_map.low)] * x_map.w_high * y_map.w_low * z_map.w_low
+         + data_in[index(x_map.low, y_map.high, z_map.low)] * x_map.w_low * y_map.w_high * z_map.w_low
+         + data_in[index(x_map.low, y_map.low, z_map.high)] * x_map.w_low * y_map.w_low * z_map.w_high
+         + data_in[index(x_map.high, y_map.high, z_map.low)] * x_map.w_high * y_map.w_high * z_map.w_low
+         + data_in[index(x_map.high, y_map.low, z_map.high)] * x_map.w_high * y_map.w_low * z_map.w_high
+         + data_in[index(x_map.low, y_map.high, z_map.high)] * x_map.w_low * y_map.w_high * z_map.w_high
+         + data_in[index(x_map.high, y_map.high, z_map.high)] * x_map.w_high * y_map.w_high * z_map.w_high;
+}
+
+void trilinear_reference(const double* const data_in,
+                         const int nx_read,
+                         const int ny_read,
+                         const int nz_read,
+                         const int nx,
+                         const int ny,
+                         const int nz,
+                         double* const data_out)
+{
+    for (int ix = 0; ix < nx; ++ix)
+    {
+        for (int iy = 0; iy < ny; ++iy)
+        {
+            for (int iz = 0; iz < nz; ++iz)
+            {
+                data_out[(ix * ny + iy) * nz + iz] =
+                    trilinear_reference_value(data_in, nx_read, ny_read, nz_read, nx, ny, nz, ix, iy, iz);
+            }
+        }
+    }
+}
+
+std::vector<double> make_interp_input(const int nx, const int ny, const int nz)
+{
+    std::vector<double> data(nx * ny * nz, 0.0);
+    for (int ix = 0; ix < nx; ++ix)
+    {
+        for (int iy = 0; iy < ny; ++iy)
+        {
+            for (int iz = 0; iz < nz; ++iz)
+            {
+                const double x = static_cast<double>(ix + 1);
+                const double y = static_cast<double>(iy + 2);
+                const double z = static_cast<double>(iz + 3);
+                data[(ix * ny + iy) * nz + iz] =
+                    std::sin(0.17 * x) + std::cos(0.23 * y) + 0.5 * std::sin(0.31 * z) + 0.01 * x * y;
+            }
+        }
+    }
+    return data;
+}
+
+double max_abs_error(const std::vector<double>& lhs, const std::vector<double>& rhs)
+{
+    double max_err = 0.0;
+    for (size_t i = 0; i < lhs.size(); ++i)
+    {
+        max_err = std::max(max_err, std::abs(lhs[i] - rhs[i]));
+    }
+    return max_err;
+}
+} // namespace
 
 /**
  * - Tested Functions:
@@ -151,29 +263,109 @@ TEST_F(RhoIOTest, TrilinearInterpolate)
         }
     }
 
-    // The old implementation is inconsistent: ifdef MPI, [x][y][z]; else, [z][x][y].
-    // Now we use [x][y][z] for both MPI and non-MPI, so here we need to chage the index order.
-    auto permute_xyz2zxy = [&](const double* const xyz, double* const zxy) -> void
-        {
-            for (int ix = 0; ix < nx; ix++)
-            {
-                for (int iy = 0; iy < ny; iy++)
-                {
-                    for (int iz = 0; iz < nz; iz++)
-                    {
-                        zxy[(iz * nx + ix) * ny + iy] = xyz[(ix * ny + iy) * nz + iz];
-                    }
-                }
-            }
-        };
     const int nxyz = nx * ny * nz;
-    std::vector<double> data_xyz(nxyz);
-    std::vector<double> data(nxyz); // z > x > y
-    ModuleIO::trilinear_interpolate(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, data_xyz.data());
-    permute_xyz2zxy(data_xyz.data(), data.data());
-    EXPECT_DOUBLE_EQ(data[0], 0.0010824725010374092);
-    EXPECT_DOUBLE_EQ(data[10], 0.058649850374240906);
-    EXPECT_DOUBLE_EQ(data[100], 0.018931708073604996);
+    std::vector<double> actual(nxyz, 0.0);
+    std::vector<double> reference(nxyz, 0.0);
+    ModuleIO::trilinear_interpolate(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, actual.data());
+    trilinear_reference(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, reference.data());
+
+    const double max_err = max_abs_error(actual, reference);
+    EXPECT_LT(max_err, 1e-6);
+}
+
+TEST_F(RhoIOTest, TrilinearInterpolateConstantFieldBoundary)
+{
+    const int nx_read = 1;
+    const int ny_read = 2;
+    const int nz_read = 3;
+    const int nx = 7;
+    const int ny = 5;
+    const int nz = 4;
+    const double constant = 3.141592653589793;
+    std::vector<double> data_read(nx_read * ny_read * nz_read, constant);
+    std::vector<double> actual(nx * ny * nz, 0.0);
+
+    ModuleIO::trilinear_interpolate(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, actual.data());
+
+    for (double value : actual)
+    {
+        EXPECT_NEAR(value, constant, 1e-12);
+    }
+}
+
+TEST_F(RhoIOTest, TrilinearInterpolateDifferentGridSizes)
+{
+    const std::vector<std::tuple<int, int, int, int, int, int>> cases = {
+        {2, 2, 2, 5, 4, 3},
+        {3, 4, 5, 6, 7, 8},
+        {4, 5, 6, 3, 4, 5},
+        {7, 5, 3, 9, 6, 4}
+    };
+
+    for (const auto& dims : cases)
+    {
+        const int nx_read = std::get<0>(dims);
+        const int ny_read = std::get<1>(dims);
+        const int nz_read = std::get<2>(dims);
+        const int nx = std::get<3>(dims);
+        const int ny = std::get<4>(dims);
+        const int nz = std::get<5>(dims);
+
+        const std::vector<double> data_read = make_interp_input(nx_read, ny_read, nz_read);
+        std::vector<double> actual(nx * ny * nz, 0.0);
+        std::vector<double> reference(nx * ny * nz, 0.0);
+
+        ModuleIO::trilinear_interpolate(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, actual.data());
+        trilinear_reference(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, reference.data());
+
+        SCOPED_TRACE(::testing::Message()
+                     << "src=(" << nx_read << "," << ny_read << "," << nz_read
+                     << "), dst=(" << nx << "," << ny << "," << nz << ")");
+        EXPECT_LT(max_abs_error(actual, reference), 1e-6);
+    }
+}
+
+TEST_F(RhoIOTest, TrilinearInterpolateBoundarySamples)
+{
+    const int nx_read = 2;
+    const int ny_read = 3;
+    const int nz_read = 4;
+    const int nx = 5;
+    const int ny = 4;
+    const int nz = 7;
+
+    std::vector<double> data_read(nx_read * ny_read * nz_read, 0.0);
+    for (int ix = 0; ix < nx_read; ++ix)
+    {
+        for (int iy = 0; iy < ny_read; ++iy)
+        {
+            for (int iz = 0; iz < nz_read; ++iz)
+            {
+                data_read[(ix * ny_read + iy) * nz_read + iz] = 100.0 * ix + 10.0 * iy + iz;
+            }
+        }
+    }
+
+    std::vector<double> actual(nx * ny * nz, 0.0);
+    ModuleIO::trilinear_interpolate(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, actual.data());
+
+    const std::array<std::array<int, 3>, 5> samples = {{
+        {{0, 0, 0}},
+        {{nx - 1, 0, 0}},
+        {{0, ny - 1, 0}},
+        {{0, 0, nz - 1}},
+        {{nx - 1, ny - 1, nz - 1}}
+    }};
+
+    for (const auto& sample : samples)
+    {
+        const int ix = sample[0];
+        const int iy = sample[1];
+        const int iz = sample[2];
+        const double expected = trilinear_reference_value(data_read.data(), nx_read, ny_read, nz_read, nx, ny, nz, ix, iy, iz);
+        const double actual_value = actual[(ix * ny + iy) * nz + iz];
+        EXPECT_LT(std::abs(actual_value - expected), 1e-6);
+    }
 }
 
 

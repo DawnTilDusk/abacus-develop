@@ -3,6 +3,52 @@
 #include <limits>
 #include "source_pw/module_pwdft/parallel_grid.h"
 #include <cstring>  // use std::memcpy
+#include <cmath>
+#include <vector>
+
+namespace
+{
+struct AxisInterpolationMap
+{
+    int low = 0;
+    int high = 0;
+    double w_low = 1.0;
+    double w_high = 0.0;
+};
+
+std::vector<AxisInterpolationMap> build_axis_interpolation_map(const int src_size, const int dst_size)
+{
+    std::vector<AxisInterpolationMap> axis_map(dst_size);
+    if (src_size <= 1)
+    {
+        for (auto& item : axis_map)
+        {
+            item.low = 0;
+            item.high = 0;
+            item.w_low = 1.0;
+            item.w_high = 0.0;
+        }
+        return axis_map;
+    }
+
+    const double scale = static_cast<double>(src_size) / static_cast<double>(dst_size);
+    const double period = static_cast<double>(src_size);
+    for (int i = 0; i < dst_size; ++i)
+    {
+        double frac = 0.5 * (scale * (1.0 + 2.0 * i) - 1.0);
+        frac -= std::floor(frac / period) * period;
+
+        const int low = static_cast<int>(frac);
+        const double delta = frac - static_cast<double>(low);
+
+        axis_map[i].low = low;
+        axis_map[i].high = (low + 1 == src_size) ? 0 : (low + 1);
+        axis_map[i].w_low = 1.0 - delta;
+        axis_map[i].w_high = delta;
+    }
+    return axis_map;
+}
+} // namespace
 
 bool ModuleIO::read_vdata_palgrid(
     const Parallel_Grid& pgrid,
@@ -87,63 +133,53 @@ void ModuleIO::trilinear_interpolate(
 {
     ModuleBase::TITLE("ModuleIO", "trilinear_interpolate");
 
-    double** read_rho = new double*[nz_read];
-    for (int iz = 0; iz < nz_read; iz++)
-    {
-        read_rho[iz] = new double[nx_read * ny_read];
-    }
-    for (int ix = 0; ix < nx_read; ix++)
-    {
-        for (int iy = 0; iy < ny_read; iy++)
-        {
-            for (int iz = 0; iz < nz_read; iz++)
-            {
-                read_rho[iz][ix * ny_read + iy] = data_in[(ix * ny_read + iy) * nz_read + iz];
-            }
-        }
-    }
-
+    const std::vector<AxisInterpolationMap> x_map = build_axis_interpolation_map(nx_read, nx);
+    const std::vector<AxisInterpolationMap> y_map = build_axis_interpolation_map(ny_read, ny);
+    const std::vector<AxisInterpolationMap> z_map = build_axis_interpolation_map(nz_read, nz);
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int ix = 0; ix < nx; ix++)
     {
-        double fracx = 0.5 * (static_cast<double>(nx_read) / nx * (1.0 + 2.0 * ix) - 1.0);
-        fracx = std::fmod(fracx, nx_read);
-        int lowx = static_cast<int>(fracx);
-        double dx = fracx - lowx;
-        int highx = (lowx == nx_read - 1) ? 0 : lowx + 1; // the point nz_read is the same as 0
         for (int iy = 0; iy < ny; iy++)
         {
-            double fracy = 0.5 * (static_cast<double>(ny_read) / ny * (1.0 + 2.0 * iy) - 1.0);
-            fracy = std::fmod(fracy, ny_read);
-            int lowy = static_cast<int>(fracy);
-            double dy = fracy - lowy;
-            int highy = (lowy == ny_read - 1) ? 0 : lowy + 1;
+            const AxisInterpolationMap& x_item = x_map[ix];
+            const AxisInterpolationMap& y_item = y_map[iy];
+
+            const int idx_x0y0 = (x_item.low * ny_read + y_item.low) * nz_read;
+            const int idx_x1y0 = (x_item.high * ny_read + y_item.low) * nz_read;
+            const int idx_x0y1 = (x_item.low * ny_read + y_item.high) * nz_read;
+            const int idx_x1y1 = (x_item.high * ny_read + y_item.high) * nz_read;
+
+            const double w00 = x_item.w_low * y_item.w_low;
+            const double w10 = x_item.w_high * y_item.w_low;
+            const double w01 = x_item.w_low * y_item.w_high;
+            const double w11 = x_item.w_high * y_item.w_high;
+
+            double* const out_row = data_out + (ix * ny + iy) * nz;
+
+#ifdef _OPENMP
+#pragma omp simd
+#endif
             for (int iz = 0; iz < nz; iz++)
             {
-                double fracz = 0.5 * (static_cast<double>(nz_read) / nz * (1.0 + 2.0 * iz) - 1.0);
-                fracz = std::fmod(fracz, nz_read);
-                int lowz = static_cast<int>(fracz);
-                double dz = fracz - lowz;
-                int highz = (lowz == nz_read - 1) ? 0 : lowz + 1;
+                const AxisInterpolationMap& z_item = z_map[iz];
+                const int lowz = z_item.low;
+                const int highz = z_item.high;
 
-                double result = read_rho[lowz][lowx * ny_read + lowy] * (1 - dx) * (1 - dy) * (1 - dz)
-                                + read_rho[lowz][highx * ny_read + lowy] * dx * (1 - dy) * (1 - dz)
-                                + read_rho[lowz][lowx * ny_read + highy] * (1 - dx) * dy * (1 - dz)
-                                + read_rho[highz][lowx * ny_read + lowy] * (1 - dx) * (1 - dy) * dz
-                                + read_rho[lowz][highx * ny_read + highy] * dx * dy * (1 - dz)
-                                + read_rho[highz][highx * ny_read + lowy] * dx * (1 - dy) * dz
-                                + read_rho[highz][lowx * ny_read + highy] * (1 - dx) * dy * dz
-                                + read_rho[highz][highx * ny_read + highy] * dx * dy * dz;
+                const double low_plane = data_in[idx_x0y0 + lowz] * w00
+                                         + data_in[idx_x1y0 + lowz] * w10
+                                         + data_in[idx_x0y1 + lowz] * w01
+                                         + data_in[idx_x1y1 + lowz] * w11;
+                const double high_plane = data_in[idx_x0y0 + highz] * w00
+                                          + data_in[idx_x1y0 + highz] * w10
+                                          + data_in[idx_x0y1 + highz] * w01
+                                          + data_in[idx_x1y1 + highz] * w11;
 
-                data_out[(ix * ny + iy) * nz + iz] = result;    // x > y > z order, consistent with the cube file
+                out_row[iz] = low_plane * z_item.w_low + high_plane * z_item.w_high;
             }
         }
     }
-
-    for (int iz = 0; iz < nz_read; iz++)
-    {
-        delete[] read_rho[iz];
-    }
-    delete[] read_rho;
 }
 
 bool ModuleIO::read_cube(const std::string& file,
