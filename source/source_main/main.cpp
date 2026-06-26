@@ -9,12 +9,16 @@
 #include "source_io/parse_args.h"
 #include "source_io/module_parameter/parameter.h"
 #include "source_main/version.h"
+#include "source_io/module_async_io/async_io_manager.h"
 
 // ============================================================================
-// 异步 I/O 支持 (题目4: 异步 I/O 与计算重叠)
-// 通过独立 I/O 工作线程使文件写入与主计算线程重叠执行
+// OMP task 异步 I/O (OpenMP 4.0 task+depend, 无 std::thread)
+// 用 #pragma omp parallel + #pragma omp single + #pragma omp task
+// 替代独立 std::thread 工作线程池。通过 -DUSE_OMP_TASK_ASYNC 启用。
 // ============================================================================
-#include "source_io/module_async_io/async_io_manager.h"
+#ifdef USE_OMP_TASK_ASYNC
+#include "source_io/module_async_io/omp_task/omp_task_manager.h"
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -94,9 +98,44 @@ int main(int argc, char** argv)
 
     // ================================================================
     // 启动异步 I/O 管理器
-    // 所有后续 write_vdata_palgrid 调用将自动使用后台 I/O 线程
-    // 主计算线程无需等待文件写入完成
     // ================================================================
+#ifdef USE_OMP_TASK_ASYNC
+    // ── OpenMP 4.0 task+depend 路径 ──
+    // 用 #pragma omp parallel + single 包裹主计算,
+    // 在 single 区域内 spawn I/O worker task 链,
+    // 然后执行 DD.init() (SCF 循环)。
+    // parallel 区域结束时的隐式 taskwait 保证所有 I/O 完成。
+    {
+        OMPTaskManager& omp_mgr = OMPTaskManager::instance();
+
+        // 允许嵌套并行: 外层 parallel (I/O workers + 主计算)
+        // 内层 parallel for (DD.init() 内部的计算)
+        omp_set_max_active_levels(2);
+
+        // 预留 I/O worker 线程数 + 主计算线程
+        // 例如 4 workers → 请求 5 个外层线程
+        const int num_workers = 4;
+        omp_mgr.init(num_workers);
+
+        #pragma omp parallel num_threads(num_workers + 1)
+        #pragma omp single
+        {
+            // Phase A: spawn I/O worker 递归链 (立即返回)
+            omp_mgr.spawn_io_workers();
+
+            // Phase B: 主计算 (master 线程执行)
+            Driver DD;
+            DD.init();
+
+            // Phase C: 通知 I/O workers 可以退出了
+            omp_mgr.signal_done();
+        }
+        // 隐式 taskwait / barrier:
+        //   所有 I/O task 链完成 + 主计算完成 → parallel 区域结束
+        //   不需要显式 wait_all() / stop()
+    }
+#else
+    // ── 原有 std::thread 路径 ──
     AsyncIOManager::instance().start(4);
 
     Driver DD;
@@ -111,6 +150,7 @@ int main(int argc, char** argv)
     // ================================================================
     AsyncIOManager::instance().wait_all();
     AsyncIOManager::instance().stop();
+#endif
 
 #ifdef __MPI
     Parallel_Global::finalize_mpi();

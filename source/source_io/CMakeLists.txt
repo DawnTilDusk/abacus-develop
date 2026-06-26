@@ -68,6 +68,14 @@ list(APPEND objects_advanced
 # ============================================================================
 add_subdirectory(module_async_io)
 
+# ============================================================================
+# OMP task async I/O (optional, header-only, OpenMP 4.0 required)
+# ============================================================================
+option(USE_OMP_TASK_ASYNC "Enable OpenMP 4.0 task+depend async I/O" OFF)
+if(USE_OMP_TASK_ASYNC)
+    add_subdirectory(module_async_io/omp_task)
+endif()
+
 # Add async_io_manager.cpp into the io_basic object list
 list(APPEND objects
     module_async_io/async_io_manager.cpp
@@ -154,6 +162,11 @@ target_link_libraries(
     async_io
     ZLIB::ZLIB
 )
+
+if(USE_OMP_TASK_ASYNC)
+    target_link_libraries(io_basic PUBLIC omp_task_async)
+    target_compile_definitions(io_basic PUBLIC USE_OMP_TASK_ASYNC)
+endif()
 
 add_library(
     io_advanced

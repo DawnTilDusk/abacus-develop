@@ -20,6 +20,14 @@
 #include "source_io/module_async_io/async_io_manager.h"
 #include "source_io/module_async_io/io_buffer.h"
 
+// ============================================================================
+// OMP task 异步 I/O (OpenMP 4.0 task+depend, 无 std::thread)
+// 通过 USE_OMP_TASK_ASYNC 宏在 CMake 中切换启用
+// ============================================================================
+#ifdef USE_OMP_TASK_ASYNC
+#include "source_io/module_async_io/omp_task/omp_task_manager.h"
+#endif
+
 void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
                                    const double* const data,
                                    const int is,
@@ -164,22 +172,45 @@ void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
         }
         // ================================================================
         // 异步 I/O 集成点 (题目4)
-        //
-        // 如果 AsyncIOManager 已启动 (start() 被调用过)，
-        // 则将数据提交到后台 I/O 线程，主线程立即返回；
-        // 否则回退到原有同步写入行为 (向后兼容)。
-        //
-        // 这样设计的好处:
-        //   1. 所有已有的 write_vdata_palgrid 调用方无需任何修改
-        //   2. 可通过在程序入口调用 start()/stop() 来启停异步 I/O
-        //   3. 在未调用 start() 时行为与原实现完全相同
         // ================================================================
-        AsyncIOManager& io_mgr = AsyncIOManager::instance();
-        if (io_mgr.is_running())
+#ifdef USE_OMP_TASK_ASYNC
+        OMPTaskManager& omp_mgr = OMPTaskManager::instance();
+        if (omp_mgr.is_running())
         {
-            // ★ 异步路径: 将数据通过 move 转移到 IOBuffer (零拷贝)
-            //         然后提交到后台 I/O 工作线程
-            //         主线程不等待，立即返回继续计算
+            // ── OpenMP 4.0 task 路径 ──
+            IOBuffer buf = IOBuffer::make_cube_write(std::move(data_xyz_full),
+                                                      fn, is, istep, precision);
+            buf.set_cube_header(comment, ucell->nat,
+                                std::vector<double>{0.0, 0.0, 0.0},
+                                nx, ny, nz,
+                                dx, dy, dz,
+                                atom_type, atom_charge, atom_pos);
+
+            auto task = std::unique_ptr<IIOTask>(
+                new CubeWriteTask(std::move(buf)));
+            omp_mgr.submit_cube_write(std::move(task));
+        }
+        else
+        {
+            write_cube(fn,
+                       comment,
+                       ucell->nat,
+                       {0.0, 0.0, 0.0},
+                       nx, ny, nz,
+                       dx, dy, dz,
+                       atom_type, atom_charge, atom_pos,
+                       data_xyz_full, precision);
+
+            end = time(nullptr);
+            ModuleBase::GlobalFunc::OUT_TIME("write_vdata_palgrid", start, end);
+        }
+#else
+        AsyncIOManager& io_mgr = AsyncIOManager::instance();
+        if (io_mgr.is_running() && io_mgr.can_submit())
+        {
+            // ★ 异步路径: have checked can_submit() first → submit now
+            //    `data_xyz_full` will be moved into IOBuffer, then worker thread writes it.
+            //    If queue full, falls through to sync path below (data_xyz_full untouched).
             IOBuffer buf = IOBuffer::make_cube_write(std::move(data_xyz_full),
                                                       fn, is, istep, precision);
             buf.set_cube_header(comment, ucell->nat,
@@ -188,6 +219,29 @@ void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
                                 dx, dy, dz,
                                 atom_type, atom_charge, atom_pos);
             io_mgr.submit_cube_write(std::move(buf));
+        }
+        else if (io_mgr.is_running())
+        {
+            // ★ 异步 I/O 队列已满: 回退到同步写入
+            //    data_xyz_full 未被移动，可以安全使用
+            write_cube(fn,
+                       comment,
+                       ucell->nat,
+                       {0.0, 0.0, 0.0},
+                       nx,
+                       ny,
+                       nz,
+                       dx,
+                       dy,
+                       dz,
+                       atom_type,
+                       atom_charge,
+                       atom_pos,
+                       data_xyz_full,
+                       precision);
+
+            end = time(nullptr);
+            ModuleBase::GlobalFunc::OUT_TIME("write_vdata_palgrid", start, end);
         }
         else
         {
@@ -211,7 +265,8 @@ void ModuleIO::write_vdata_palgrid(const Parallel_Grid& pgrid,
             end = time(nullptr);
             ModuleBase::GlobalFunc::OUT_TIME("write_vdata_palgrid", start, end);
         }
-    }
+#endif  // USE_OMP_TASK_ASYNC / else (original std::thread path)
+    }  // closes: if ((!reduce_all_pool && my_rank == 0) || ...)
 
     return;
 }
@@ -622,6 +677,29 @@ void ModuleIO::write_vdata_palgrid_async(const Parallel_Grid& pgrid,
         // ----
 
         // 获取异步 I/O 管理器单例
+#ifdef USE_OMP_TASK_ASYNC
+        OMPTaskManager& omp_mgr = OMPTaskManager::instance();
+        if (omp_mgr.is_running())
+        {
+            IOBuffer buf = IOBuffer::make_cube_write(std::move(data_xyz_full),
+                                                      fn, is, istep, precision);
+            buf.set_cube_header(comment, ucell->nat,
+                                std::vector<double>{0.0, 0.0, 0.0},
+                                nx, ny, nz,
+                                dx, dy, dz,
+                                atom_type, atom_charge, atom_pos);
+            auto task = std::unique_ptr<IIOTask>(
+                new CubeWriteTask(std::move(buf)));
+            omp_mgr.submit_cube_write(std::move(task));
+        }
+        else
+        {
+            write_cube(fn, comment, ucell->nat, {0.0, 0.0, 0.0},
+                       nx, ny, nz, dx, dy, dz,
+                       atom_type, atom_charge, atom_pos,
+                       data_xyz_full, precision);
+        }
+#else
         AsyncIOManager& io_mgr = AsyncIOManager::instance();
 
         if (io_mgr.is_running() && io_mgr.can_submit())
@@ -654,9 +732,10 @@ void ModuleIO::write_vdata_palgrid_async(const Parallel_Grid& pgrid,
                        data_xyz_full,
                        precision);
         }
-    }
+#endif  // USE_OMP_TASK_ASYNC / else (original std::thread path)
+    }  // closes: if (i_am_writer)
 
     // ---- 步骤3: 非写入进程直接返回 (无需等待 I/O 完成) ----
     return;
 }
-#endif
+#endif  // __MPI

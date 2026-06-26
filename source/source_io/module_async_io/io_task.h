@@ -23,6 +23,20 @@
 //   3. 执行结果通过 IOBuffer::error_message 传播给主线程
 // ============================================================================
 
+// ============================================================================
+// TaskAffinity: 任务亲和性标记
+//
+// 用于区分 I/O 任务是否可以与其他任务并行执行:
+//   INDEPENDENT     — 操作独立文件，可安全并行
+//   SERIALIZE_ALL   — 操作共享文件，需独占所有 worker
+//
+// 所有已有子类默认 INDEPENDENT，无需修改。
+// ============================================================================
+enum class TaskAffinity {
+    INDEPENDENT,      ///< 可与其他 INDEPENDENT 任务并行
+    SERIALIZE_ALL     ///< 需独占执行，等待所有进行中任务完成
+};
+
 /// @brief 异步 I/O 任务的抽象基类
 class IIOTask
 {
@@ -48,6 +62,9 @@ class IIOTask
 
     /// @brief 获取任务名称 (用于日志输出)
     virtual std::string task_name() const = 0;
+
+    /// @brief 返回任务亲和性 (默认 INDEPENDENT — 操作独立文件，可并行)
+    virtual TaskAffinity affinity() const { return TaskAffinity::INDEPENDENT; }
 };
 
 // ============================================================================

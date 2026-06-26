@@ -65,6 +65,10 @@ add_library(
     ${objects}
 )
 
+if(USE_OMP_TASK_ASYNC)
+    target_link_libraries(elecstate PUBLIC omp_task_async)
+endif()
+
 if(ENABLE_COVERAGE)
   add_coverage(elecstate)
 endif()

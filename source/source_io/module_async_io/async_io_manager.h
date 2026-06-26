@@ -57,6 +57,12 @@
 // ============================================================================
 
 /// @brief 异步 I/O 管理器 (单例模式)
+///
+/// 多 worker 并行 I/O (v2):
+///   start(max_queue_size, num_workers) 创建 N 个工作线程同时消费任务队列。
+///   通过 TaskAffinity 标记区分可并行任务 (INDEPENDENT) 与需独占任务
+///   (SERIALIZE_ALL)，在并行文件系统上实现多文件并发写入。
+///   默认 num_workers=1，向后兼容原有行为。
 class AsyncIOManager
 {
   public:
@@ -73,9 +79,13 @@ class AsyncIOManager
     AsyncIOManager(const AsyncIOManager&) = delete;
     AsyncIOManager& operator=(const AsyncIOManager&) = delete;
 
-    /// @brief 启动 I/O 工作线程
+    /// @brief 启动 I/O 工作线程池
     /// @param max_queue_size  队列最大容量 (0 表示无限制)
-    void start(size_t max_queue_size = 4);
+    /// @param num_workers     I/O 工作线程数 (默认 1，向后兼容)
+    void start(size_t max_queue_size = 4, size_t num_workers = 1);
+
+    /// @brief 获取当前 worker 线程数
+    size_t num_workers() const { return num_workers_; }
 
     /// @brief 等待所有已提交的任务完成
     void wait_all();
@@ -155,13 +165,15 @@ class AsyncIOManager
     // ======================== 工作线程逻辑 ========================
 
     /// @brief I/O 工作线程主循环
-    void io_loop();
+    /// @param worker_id  worker 编号 (0-based, 用于日志)
+    void io_loop(size_t worker_id);
 
     // ======================== 成员变量 ========================
 
     // ---- 线程管理 ----
-    std::thread io_worker_;                 ///< 独立 I/O 工作线程
-    std::atomic<bool> running_{false};      ///< 控制线程运行
+    std::vector<std::thread> io_workers_;    ///< I/O 工作线程池
+    std::atomic<bool> running_{false};       ///< 控制线程运行
+    size_t num_workers_ = 1;                 ///< 当前 worker 线程数
 
     // ---- 任务队列 (生产者-消费者) ----
     std::queue<std::unique_ptr<IIOTask>> task_queue_;  ///< 待处理任务队列
@@ -171,6 +183,11 @@ class AsyncIOManager
     mutable std::mutex queue_mutex_;         ///< 保护 task_queue_ 和 completed_queue_ 的并发访问
     std::condition_variable cv_;             ///< 任务到达 / 完成通知
     std::atomic<size_t> in_flight_tasks_{0}; ///< 正在执行(已出队但未完成)的任务数
+
+    // ---- 独占模式同步 (SERIALIZE_ALL 任务) ----
+    std::condition_variable cv_exclusive_;        ///< 等待所有 INDEPENDENT 任务完成
+    std::atomic<bool> exclusive_pending_{false};  ///< 是否有 SERIALIZE_ALL 任务在排队
+    std::atomic<size_t> exclusive_epoch_{0};      ///< 独占版本号 (防止 ABA)
 
     // ---- 完成队列 (I/O 工作线程写入, 主线程消费) ----
     std::queue<IOBuffer> completed_queue_;   ///< 已完成任务的缓冲区队列

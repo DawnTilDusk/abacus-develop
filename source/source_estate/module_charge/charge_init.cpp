@@ -20,6 +20,10 @@
 #include "source_io/module_restart/restart.h"
 #include "source_io/module_async_io/async_io_manager.h"
 #include "source_io/module_async_io/io_buffer.h"
+
+#ifdef USE_OMP_TASK_ASYNC
+#include "source_io/module_async_io/omp_task/omp_task_manager.h"
+#endif
 #include "source_hamilt/module_xc/xc_functional.h"
 #include "source_cell/klist.h"
 
@@ -68,9 +72,17 @@ void Charge::init_rho(const UnitCell& ucell,
 
     bool read_error = false;
     bool read_kin_error = false;
+
+#ifdef USE_OMP_TASK_ASYNC
+    // ── OpenMP 4.0 task 路径 ──
+    // 不需要 RAII 守卫: parallel 区域的隐式 taskwait 保证所有 task 完成
+    // OMPTaskManager 已在 main.cpp 的 parallel single 区域内初始化
+    OMPTaskManager& omp_mgr = OMPTaskManager::instance();
+#else
     // RAII 守卫: 确保函数退出时等待所有异步 I/O 完成
     AsyncIOManager& async_mgr = AsyncIOManager::instance();
     AsyncIOScopeGuard io_guard(async_mgr);
+#endif
 
     if (PARAM.inp.init_chg == "file" || PARAM.inp.init_chg == "auto")
     {
@@ -102,7 +114,11 @@ void Charge::init_rho(const UnitCell& ucell,
         }
 // async_mgr 已在上文通过 RAII 守卫初始化
         // 获取异步 I/O 管理器实例 (已在 main.cpp 中启动)
+#ifdef USE_OMP_TASK_ASYNC
+        OMPTaskManager& async_mgr = OMPTaskManager::instance();
+#else
         AsyncIOManager& async_mgr = AsyncIOManager::instance();
+#endif
 
         // rank 0 (in pool) 提交异步读取任务
         // 注意: 仅 rank 0 执行文件 I/O, 其余进程在 Phase 2 中等待广播
@@ -110,7 +126,13 @@ void Charge::init_rho(const UnitCell& ucell,
         if (GlobalV::RANK_IN_POOL == 0)
         {
             IOBuffer read_buf = IOBuffer::make_binary_read_result(binary_path, rhopw->npw);
+#ifdef USE_OMP_TASK_ASYNC
+            auto read_task = std::unique_ptr<IIOTask>(
+                new RhogReadTask(std::move(read_buf)));
+            async_read_submitted = async_mgr.submit_rhog_read(std::move(read_task));
+#else
             async_read_submitted = async_mgr.submit_rhog_read(std::move(read_buf));
+#endif
             if (async_read_submitted)
             {
                 GlobalV::ofs_running << " [TIMER] Async rhog read submitted: " << binary_path << std::endl;

@@ -422,6 +422,10 @@ if(USE_OPENMP)
   add_link_options(${OpenMP_CXX_LIBRARIES})
 endif()
 
+if(USE_OMP_TASK_ASYNC)
+  target_compile_definitions(${ABACUS_BIN_NAME} PUBLIC USE_OMP_TASK_ASYNC)
+endif()
+
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)

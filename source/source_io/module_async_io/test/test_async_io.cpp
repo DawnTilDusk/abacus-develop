@@ -12,6 +12,9 @@
 //   6. 多任务提交与顺序保证
 //   7. 错误传播
 //   8. 析构安全性
+//   9. 多 worker 并行写入
+//   10. TaskAffinity 独占正确性
+//   11. 混合亲和性压力测试
 //
 // 参考:
 //   source/source_io/test_serial/rho_io_test.cpp
@@ -54,6 +57,36 @@ static void clean_file(const std::string& path)
 }
 
 // ====================================================================
+// 测试辅助: TaskAffinity 测试专用的独占任务
+// 重写 affinity() 返回 SERIALIZE_ALL，模拟操作共享文件的场景
+// ====================================================================
+class ExclusiveBinaryWriteTask : public IIOTask
+{
+  public:
+    explicit ExclusiveBinaryWriteTask(IOBuffer&& buf) : buf_(std::move(buf)) {}
+
+    bool execute() override
+    {
+        FILE* fp = fopen(buf_.filename().c_str(), "wb");
+        if (!fp) { buf_.set_error("cannot open " + buf_.filename()); return false; }
+        const std::vector<double>& d = buf_.data();
+        size_t w = fwrite(d.data(), sizeof(double), d.size(), fp);
+        fclose(fp);
+        return w == d.size();
+    }
+
+    IOBuffer& buffer() override { return buf_; }
+    const IOBuffer& buffer() const override { return buf_; }
+    std::string task_name() const override { return "ExclusiveBinaryWrite"; }
+
+    /// @brief 返回 SERIALIZE_ALL — 需独占所有 worker
+    TaskAffinity affinity() const override { return TaskAffinity::SERIALIZE_ALL; }
+
+  private:
+    IOBuffer buf_;
+};
+
+// ====================================================================
 // 测试夹具
 // ====================================================================
 
@@ -90,6 +123,10 @@ class AsyncIOManagerTest : public ::testing::Test
         clean_file("test_async_multi_1.cube");
         clean_file("test_async_multi_2.cube");
         clean_file("test_async_error.cube");
+        for (int i = 0; i < 10; ++i) {
+            clean_file("test_mw_" + std::to_string(i) + ".bin");
+            clean_file("test_aff_" + std::to_string(i) + ".bin");
+        }
     }
 };
 
@@ -415,6 +452,192 @@ TEST_F(AsyncIOManagerTest, StateQueries)
     EXPECT_EQ(mgr.pending_count(), 0);
 
     clean_file("test_state.bin");
+    mgr.stop();
+}
+
+// ====================================================================
+// 测试用例 9: 多 worker 并行写入
+// ====================================================================
+
+TEST_F(AsyncIOManagerTest, MultiWorkerParallelWrite)
+{
+    const int n_files = 4;
+    const size_t data_size = 10000;  // 足够大，确保任务不会瞬间完成
+
+    // 启动 4 个 worker
+    mgr.start(8, 4);
+    EXPECT_EQ(mgr.num_workers(), 4u);
+
+    for (int i = 0; i < n_files; ++i)
+    {
+        std::vector<double> data(data_size, static_cast<double>(i));
+        std::string fn = "test_mw_" + std::to_string(i) + ".bin";
+        IOBuffer buf = IOBuffer::make_binary_write(std::move(data), fn);
+        bool ok = mgr.submit_binary_write(std::move(buf));
+        EXPECT_TRUE(ok) << "Task " << i << " submission failed";
+    }
+
+    mgr.wait_all();
+
+    // 验证所有文件正确写入
+    EXPECT_EQ(mgr.total_submitted(), static_cast<size_t>(n_files));
+    EXPECT_EQ(mgr.total_completed(), static_cast<size_t>(n_files));
+    EXPECT_EQ(mgr.total_rejected(), 0u);
+
+    for (int i = 0; i < n_files; ++i)
+    {
+        std::string fn = "test_mw_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(fn.c_str(), "rb");
+        ASSERT_NE(fp, nullptr) << "File " << fn << " should exist";
+
+        std::vector<double> readback(data_size);
+        size_t n = fread(readback.data(), sizeof(double), data_size, fp);
+        fclose(fp);
+
+        EXPECT_EQ(n, data_size);
+        for (size_t j = 0; j < data_size; ++j)
+        {
+            EXPECT_DOUBLE_EQ(readback[j], static_cast<double>(i))
+                << "File " << fn << " at index " << j;
+        }
+    }
+
+    mgr.stop();
+}
+
+// ====================================================================
+// 测试用例 10: TaskAffinity 独占正确性
+// 验证 SERIALIZE_ALL 任务在所有 INDEPENDENT 完成后才执行
+// ====================================================================
+
+TEST_F(AsyncIOManagerTest, TaskAffinitySerialize)
+{
+    const size_t data_size = 50000;
+
+    mgr.start(8, 2);  // 2 个 worker
+
+    // 提交 2 个 INDEPENDENT 任务
+    for (int i = 0; i < 2; ++i)
+    {
+        std::vector<double> data(data_size, static_cast<double>(i));
+        std::string fn = "test_aff_" + std::to_string(i) + ".bin";
+        IOBuffer buf = IOBuffer::make_binary_write(std::move(data), fn);
+        bool ok = mgr.submit_binary_write(std::move(buf));
+        EXPECT_TRUE(ok);
+    }
+
+    // 提交 1 个 SERIALIZE_ALL 任务 (通过 ExclusiveBinaryWriteTask)
+    {
+        std::vector<double> data(data_size, 99.0);
+        IOBuffer buf = IOBuffer::make_binary_write(std::move(data), "test_aff_9.bin");
+        auto task = std::unique_ptr<IIOTask>(new ExclusiveBinaryWriteTask(std::move(buf)));
+        TaskAffinity aff = task->affinity();
+        EXPECT_EQ(aff, TaskAffinity::SERIALIZE_ALL);
+        bool ok = mgr.submit_task(std::move(task));
+        EXPECT_TRUE(ok);
+    }
+
+    mgr.wait_all();
+
+    EXPECT_EQ(mgr.total_submitted(), 3u);
+    EXPECT_EQ(mgr.total_completed(), 3u);
+    EXPECT_EQ(mgr.total_rejected(), 0u);
+
+    // 验证所有文件正确写入
+    for (int i = 0; i < 2; ++i)
+    {
+        std::string fn = "test_aff_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(fn.c_str(), "rb");
+        ASSERT_NE(fp, nullptr);
+        std::vector<double> rb(data_size);
+        fread(rb.data(), sizeof(double), data_size, fp);
+        fclose(fp);
+        EXPECT_DOUBLE_EQ(rb[0], static_cast<double>(i));
+    }
+
+    // 验证独占任务文件
+    {
+        FILE* fp = fopen("test_aff_9.bin", "rb");
+        ASSERT_NE(fp, nullptr);
+        std::vector<double> rb(data_size);
+        fread(rb.data(), sizeof(double), data_size, fp);
+        fclose(fp);
+        EXPECT_DOUBLE_EQ(rb[0], 99.0);
+    }
+
+    mgr.stop();
+}
+
+// ====================================================================
+// 测试用例 11: 混合亲和性压力测试
+// 交替提交 INDEPENDENT 和 SERIALIZE_ALL，验证无死锁、无数据损坏
+// ====================================================================
+
+TEST_F(AsyncIOManagerTest, MixedAffinityStress)
+{
+    const int rounds = 10;
+    const size_t data_size = 1000;
+
+    mgr.start(0, 4);  // 4 个 worker, 无限制队列 (避免满队列拒绝)
+
+    for (int r = 0; r < rounds; ++r)
+    {
+        // 提交 1 个 INDEPENDENT 任务
+        {
+            std::vector<double> data(data_size, static_cast<double>(r * 2));
+            std::string fn = "test_mw_" + std::to_string(r) + ".bin";
+            IOBuffer buf = IOBuffer::make_binary_write(std::move(data), fn);
+            bool ok = mgr.submit_binary_write(std::move(buf));
+            EXPECT_TRUE(ok) << "INDEPENDENT round " << r << " failed";
+        }
+
+        // 提交 1 个 SERIALIZE_ALL 任务
+        {
+            std::vector<double> data(data_size, static_cast<double>(r * 2 + 1));
+            std::string fn = "test_aff_" + std::to_string(r) + ".bin";
+            IOBuffer buf = IOBuffer::make_binary_write(std::move(data), fn);
+            auto task = std::unique_ptr<IIOTask>(
+                new ExclusiveBinaryWriteTask(std::move(buf)));
+            bool ok = mgr.submit_task(std::move(task));
+            EXPECT_TRUE(ok) << "SERIALIZE_ALL round " << r << " failed";
+        }
+    }
+
+    mgr.wait_all();
+
+    // 验证统计
+    EXPECT_EQ(mgr.total_submitted(), static_cast<size_t>(rounds * 2));
+    EXPECT_EQ(mgr.total_completed(), static_cast<size_t>(rounds * 2));
+    EXPECT_EQ(mgr.total_rejected(), 0u);
+
+    // 验证所有文件 (挑几个采样验证，避免测试过慢)
+    for (int r = 0; r < rounds; ++r)
+    {
+        // INDEPENDENT 任务文件
+        {
+            std::string fn = "test_mw_" + std::to_string(r) + ".bin";
+            FILE* fp = fopen(fn.c_str(), "rb");
+            ASSERT_NE(fp, nullptr) << "Missing INDEPENDENT file round " << r;
+            std::vector<double> rb(data_size);
+            size_t n = fread(rb.data(), sizeof(double), data_size, fp);
+            fclose(fp);
+            EXPECT_EQ(n, data_size);
+            EXPECT_DOUBLE_EQ(rb[0], static_cast<double>(r * 2));
+        }
+
+        // SERIALIZE_ALL 任务文件
+        {
+            std::string fn = "test_aff_" + std::to_string(r) + ".bin";
+            FILE* fp = fopen(fn.c_str(), "rb");
+            ASSERT_NE(fp, nullptr) << "Missing SERIALIZE_ALL file round " << r;
+            std::vector<double> rb(data_size);
+            size_t n = fread(rb.data(), sizeof(double), data_size, fp);
+            fclose(fp);
+            EXPECT_EQ(n, data_size);
+            EXPECT_DOUBLE_EQ(rb[0], static_cast<double>(r * 2 + 1));
+        }
+    }
+
     mgr.stop();
 }
 

@@ -18,7 +18,7 @@
 // 1. 生命周期管理
 // ==================================================================
 
-void AsyncIOManager::start(size_t max_queue_size)
+void AsyncIOManager::start(size_t max_queue_size, size_t num_workers)
 {
     // 防止重复启动
     if (running_.exchange(true))
@@ -28,11 +28,17 @@ void AsyncIOManager::start(size_t max_queue_size)
     }
 
     max_queue_size_ = max_queue_size;
+    num_workers_ = (num_workers > 0) ? num_workers : 1;
 
-    // 创建工作线程: 调用 io_loop() 进入主循环
-    io_worker_ = std::thread(&AsyncIOManager::io_loop, this);
+    // 创建 N 个工作线程，每个调用 io_loop(worker_id)
+    io_workers_.reserve(num_workers_);
+    for (size_t i = 0; i < num_workers_; ++i)
+    {
+        io_workers_.emplace_back(&AsyncIOManager::io_loop, this, i);
+    }
 
-    std::cout << "AsyncIOManager: I/O worker thread started (max_queue="
+    std::cout << "AsyncIOManager: " << num_workers_
+              << " I/O worker thread(s) started (max_queue="
               << max_queue_size_ << ")" << std::endl;
 }
 
@@ -80,16 +86,22 @@ void AsyncIOManager::stop()
     // 1. 设置停止标志
     running_.store(false);
 
-    // 2. 唤醒工作线程 (让其检查 running_ 并退出)
+    // 2. 唤醒所有工作线程和独占等待者
     cv_.notify_all();
+    cv_exclusive_.notify_all();
 
-    // 3. 等待工作线程结束
-    if (io_worker_.joinable())
+    // 3. 等待所有工作线程结束
+    for (size_t i = 0; i < io_workers_.size(); ++i)
     {
-        io_worker_.join();
+        if (io_workers_[i].joinable())
+        {
+            io_workers_[i].join();
+        }
     }
+    io_workers_.clear();
 
-    std::cout << "AsyncIOManager: I/O worker thread stopped."
+    std::cout << "AsyncIOManager: " << num_workers_
+              << " I/O worker thread(s) stopped."
               << " (submitted=" << stats_total_submitted_.load()
               << ", completed=" << stats_total_completed_.load()
               << ", rejected=" << stats_total_rejected_.load() << ")"
@@ -194,80 +206,126 @@ bool AsyncIOManager::submit_task(std::unique_ptr<IIOTask> task)
         stats_total_submitted_.fetch_add(1);
     }
 
-    // 通知工作线程有新任务到达
-    cv_.notify_one();
+    // 通知所有工作线程有新任务到达 (多 worker 时需唤醒全部)
+    cv_.notify_all();
 
     return true;
 }
 
 // ==================================================================
-// 3. 工作线程主循环
+// 4. 工作线程主循环 (多 worker 竞争出队 + 亲和性检查)
 // ==================================================================
 
-void AsyncIOManager::io_loop()
+void AsyncIOManager::io_loop(size_t worker_id)
 {
     while (true)
     {
         std::unique_ptr<IIOTask> current_task;
+        bool is_exclusive = false;
 
+        // ---- Phase 1: 竞争出队（加锁） ----
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
 
-            // 等待任务到达或停止信号
-            cv_.wait(lock, [this]() {
-                return !task_queue_.empty() || !running_.load();
+            // 记录当前独占版本号，用于防止 ABA
+            size_t my_epoch = exclusive_epoch_.load();
+
+            // 等待条件: 队列非空 或 停止 或 独占模式下所有 INDEPENDENT 完成
+            cv_.wait(lock, [this, my_epoch]() {
+                return !task_queue_.empty() || !running_.load()
+                    || (exclusive_pending_.load()
+                        && in_flight_tasks_.load() == 0
+                        && exclusive_epoch_.load() != my_epoch);
             });
 
-            // 如果被唤醒但已停止且队列为空，退出循环
+            // 停止 + 队列空 → 退出
             if (!running_.load() && task_queue_.empty())
             {
                 break;
             }
 
-            // 如果队列为空但仍在运行，继续等待
+            // 队列空 (被 cv_exclusive_ 唤醒或虚假唤醒) → 继续等待
             if (task_queue_.empty())
             {
                 continue;
             }
 
-            // 取出一个任务
-            current_task = std::move(task_queue_.front());
-            task_queue_.pop();
-            in_flight_tasks_.fetch_add(1);
+            // 查看队首任务的亲和性
+            TaskAffinity aff = task_queue_.front()->affinity();
+
+            if (aff == TaskAffinity::SERIALIZE_ALL)
+            {
+                // 独占任务: 等待所有进行中任务完成
+                if (in_flight_tasks_.load() > 0)
+                {
+                    exclusive_pending_.store(true);
+                    continue;  // 重新进入等待循环
+                }
+
+                // in_flight_tasks_ == 0: 可以执行独占任务
+                exclusive_pending_.store(true);
+                current_task = std::move(task_queue_.front());
+                task_queue_.pop();
+                is_exclusive = true;
+            }
+            else // INDEPENDENT
+            {
+                // 如果有独占任务在排队，INDEPENDENT 任务不能出队
+                if (exclusive_pending_.load())
+                {
+                    continue;
+                }
+
+                current_task = std::move(task_queue_.front());
+                task_queue_.pop();
+            }
+
+            if (current_task)
+            {
+                in_flight_tasks_.fetch_add(1);
+            }
+            // 锁在此处释放 (unique_lock 析构)
         }
 
-        // ---- 在锁外执行阻塞 I/O ----
-        // 这样做的好处:
-        //   1. 主线程可以在 I/O 执行期间继续提交新任务
-        //   2. I/O 操作不会阻塞队列访问
-
+        // ---- Phase 2: 执行 I/O（锁外） ----
         if (current_task)
         {
             bool success = current_task->execute();
 
             if (!success)
             {
-                // 记录错误日志
                 const IOBuffer& buf = current_task->buffer();
-                std::cerr << "AsyncIOManager: " << current_task->task_name()
+                std::cerr << "AsyncIOManager[worker " << worker_id << "]: "
+                          << current_task->task_name()
                           << " failed for file " << buf.filename()
                           << ": " << buf.error_message() << std::endl;
             }
 
-            // 将已完成任务的缓冲区推入完成队列 (主线程通过 pop_completed 消费)
+            // 推入完成队列
             {
                 std::lock_guard<std::mutex> lock(queue_mutex_);
                 completed_queue_.push(std::move(current_task->buffer()));
             }
 
-            // 更新统计
             stats_total_completed_.fetch_add(1);
 
-            // 标记任务已完成 (通知可能在 wait_all 中的主线程)
-            in_flight_tasks_.fetch_sub(1);
+            size_t remaining = in_flight_tasks_.fetch_sub(1) - 1;
+
+            // 独占任务完成: 解除独占标记, 递增版本号防止 ABA
+            if (is_exclusive)
+            {
+                exclusive_pending_.store(false);
+                exclusive_epoch_.fetch_add(1);
+            }
+            // 最后一个 INDEPENDENT 任务完成: 通知独占等待者
+            else if (remaining == 0 && exclusive_pending_.load())
+            {
+                exclusive_epoch_.fetch_add(1);
+                cv_exclusive_.notify_all();
+            }
         }
 
-        // 唤醒可能正在 wait_all 或 wait_next_completed 中的主线程
+        // 唤醒可能在 wait_all / wait_next_completed / 其他 worker 中等待的线程
         cv_.notify_all();
     }
 }
