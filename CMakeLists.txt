@@ -898,6 +898,14 @@ if(NOT MSVC)
   list(APPEND math_libs m)
 endif()
 target_link_libraries(${ABACUS_BIN_NAME} ${math_libs})
+if(NOT TARGET ZLIB::ZLIB)
+  find_package(ZLIB REQUIRED)
+endif()
+if(TARGET ZLIB::ZLIB)
+  target_link_libraries(${ABACUS_BIN_NAME} ZLIB::ZLIB)
+else()
+  target_link_libraries(${ABACUS_BIN_NAME} ${ZLIB_LIBRARIES})
+endif()
 
 # ZLIB is required by charge_compress.cpp (compiled into io_basic OBJECT library).
 # OBJECT libraries cannot propagate link dependencies to final targets.
